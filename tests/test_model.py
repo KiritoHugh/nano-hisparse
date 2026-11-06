@@ -53,3 +53,43 @@ def test_incremental_logits_match_full_causal_forward_after_offload(device):
         model.prefill(history, cache, "a")
     cache.release_request("a")
     cache.assert_invariants()
+
+
+def test_qwen2_huggingface_parity(tmp_path):
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(8)
+    cfg = ModelConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=64,
+    )
+    hf_cfg = transformers.Qwen2Config(**vars(cfg), attention_dropout=0, tie_word_embeddings=False)
+    hf = transformers.Qwen2ForCausalLM(hf_cfg).eval()
+    model = Model(cfg).eval()
+    model.load_state_dict(hf.state_dict(), strict=True)
+    # Also exercise the actual pretrained adapter, including config migrations.
+    hf.save_pretrained(tmp_path)
+    loaded = Model.from_pretrained(str(tmp_path), device="cpu", dtype=torch.float32)
+    tokens = [1, 7, 3, 4, 9, 11, 17]
+    with torch.inference_mode():
+        expected = hf(torch.tensor([tokens])).logits[0, -1]
+    torch.testing.assert_close(model.prefill(tokens), expected, atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(loaded.prefill(tokens), expected, atol=2e-6, rtol=2e-5)
+    cache = HybridKVCache(
+        CacheConfig(gpu_pages=12, host_pages=16, page_size=3, kv_heads=2, head_dim=8, device="cpu"),
+        HotConfig(12, 12),
+    )
+    cache.reserve("a", 12, 2)
+    model.prefill(tokens, cache, "a")
+    for token in [12, 19, 5]:
+        tokens.append(token)
+        actual = model.decode(token, "a", cache)
+        with torch.inference_mode():
+            expected = hf(torch.tensor([tokens])).logits[0, -1]
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+
+    cache.release_request("a")
+    cache.assert_invariants()

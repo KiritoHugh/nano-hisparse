@@ -1,4 +1,9 @@
-"""A small decoder with RoPE, RMSNorm, SwiGLU and grouped-query attention."""
+"""A small Qwen2-shaped decoder, plus an adapter for real Qwen2/2.5 weights.
+
+The default random model validates inference mechanics; it is not a trained
+language model. Pretrained loading is optional and uses standard HF modules as
+weight containers. All KV management and decode attention run through our code.
+"""
 
 from __future__ import annotations
 
@@ -89,6 +94,35 @@ class Model(nn.Module):
         self.config = config or ModelConfig()
         self.model = Decoder(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+
+    @classmethod
+    def from_pretrained(cls, name: str, device="cuda", dtype=torch.bfloat16):
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        cfg = AutoConfig.from_pretrained(name)
+        # Transformers 4 stores rope_theta directly; 5 normalizes even standard
+        # RoPE into rope_parameters (and may expose it through rope_scaling).
+        rope = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None)
+        rope = rope or {}
+        if (
+            cfg.model_type != "qwen2"
+            or rope.get("rope_type", rope.get("type", "default")) != "default"
+        ):
+            raise ValueError("only Qwen2/Qwen2.5 with standard RoPE are supported")
+        if getattr(cfg, "use_sliding_window", False) or cfg.hidden_act != "silu":
+            raise ValueError("sliding window / non-SiLU models are unsupported")
+        hf = AutoModelForCausalLM.from_pretrained(name, torch_dtype=dtype).eval().to(device)
+        result = cls.__new__(cls)
+        nn.Module.__init__(result)
+        fields = {
+            name: getattr(cfg, name)
+            for name in ModelConfig.__dataclass_fields__
+            if name != "rope_theta"
+        }
+        fields["rope_theta"] = rope.get("rope_theta", getattr(cfg, "rope_theta", 10000.0))
+        result.config = ModelConfig(**fields)
+        result.model, result.lm_head = hf.model, hf.lm_head
+        return result.eval()
 
     @property
     def device(self):

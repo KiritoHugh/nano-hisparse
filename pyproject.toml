@@ -17,6 +17,7 @@ Repository = "https://github.com/KiritoHugh/nano-hisparse"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.9", "build>=1.2"]
+models = ["transformers>=4.46,<6", "safetensors", "huggingface-hub"]
 
 [tool.setuptools.packages.find]
 include = ["nano_hisparse*"]
