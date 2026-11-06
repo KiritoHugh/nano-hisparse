@@ -1,5 +1,7 @@
 # nano-hisparse
 
+English | [简体中文](README.zh-CN.md)
+
 A small inference engine for decoding with partially resident KV caches. Inspired by [HiSparse in vLLM](https://github.com/vllm-project/vllm/tree/abf98672ce7e822701f7a062bf240efb2c9900d1/vllm/v1/hisparse) and the compact organization of [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm).
 
 The full KV history has host backing. Resident pages and reusable hot buffers share **one GPU tensor**. Each decode step reads resident rows directly and loads only missing selected rows from host memory. A request keeps generating after its historical pages are evicted, without restoring the entire KV cache or repeating prefill.
