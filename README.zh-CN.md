@@ -4,7 +4,7 @@
 
 一个支持 KV Cache 部分驻留的轻量推理引擎。参考 [vLLM 中的 HiSparse](https://github.com/vllm-project/vllm/tree/abf98672ce7e822701f7a062bf240efb2c9900d1/vllm/v1/hisparse) 的设计，以及 [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) 的简洁代码组织方式。
 
-完整 KV 历史由主存提供后备存储。驻留页与可复用的热缓冲区（hot buffer）共享**同一个 GPU tensor**。每步 decode 直接读取驻留行，只从主存加载本步选中但缺失的行。历史页被逐出后，请求仍可继续生成，无需恢复整个 KV Cache，也无需重新 prefill。
+完整 KV 历史由主存提供后备存储。驻留页是仍保存在 GPU 上的 KV 页；热缓冲区（hot buffer）是把已卸载的 KV 行临时加载回 GPU 时使用的可复用空间。两者共享**同一个 GPU tensor**。每步 decode 直接读取驻留行，只从主存加载本步选中但缺失的行。历史页被逐出后，请求仍可继续生成，无需恢复整个 KV Cache，也无需重新 prefill。
 
 ## 快速开始
 
@@ -22,7 +22,7 @@ python -m pip install -e '.[dev]'
 nano-hisparse demo --device cpu
 ```
 
-演示使用随机模型权重，输出用于观察执行过程和计数器，不代表有意义的文本。默认 KV 池只能容纳一个请求所需的最小 hot/tail 配额。三个较长的输入依次通过准入，每个请求只执行一次 prefill，之后增量解码。
+演示使用随机模型权重，输出用于观察执行过程和计数器，不代表有意义的文本。默认 KV 池只能容纳一个请求所需的热缓冲区和两个活跃尾页块（保护序列末尾追加 KV 的区域）。三个较长的输入依次通过准入，即先确认能够预留所需的 GPU、主存和索引容量，再开始执行。每个请求只执行一次 prefill，之后增量解码。
 
 安装 CUDA 版 PyTorch 后，可运行：
 
@@ -41,9 +41,11 @@ nano-hisparse generate --model Qwen/Qwen2.5-0.5B-Instruct \
   --prompt '请解释 KV Cache 的工作原理。' --top-k 4 --max-new-tokens 64
 ```
 
-首次运行会下载权重。`--top-k 4` 是**页预算**：Quest 风格选择器通过页内 K 的 min/max 边界评分，将 sink 页和尾页计入预算，再把选中页展开为页内全部有效 token。默认每页 16 个 token，四页对应每个 query head 最多 64 个 token。缓存本身按 token row 解析和加载，下文的 row trace 示例直接验证这个更细的粒度。`--top-k all` 使用完整 attention，并预留相应更大的工作集。稀疏选择可能改变模型输出，其近似误差与缓存存储是否正确是两个独立问题。[examples/generate.py](examples/generate.py) 展示了 Python API 的用法。
+首次运行会下载权重。`--top-k 4` 是**页预算**：Quest 风格选择器通过页内 K 的 min/max 边界评分，将 sink 页（序列第一页）和尾页（当前最后一页）计入预算，再把选中页展开为页内全部有效 token。默认每页 16 个 token，四页对应每个 query head 最多 64 个 token。缓存本身按 token row 解析和加载，下文的 row trace 示例直接验证这个更细的粒度。`--top-k all` 使用完整 attention，并预留相应更大的工作集。稀疏选择可能改变模型输出，其近似误差与缓存存储是否正确是两个独立问题。[examples/generate.py](examples/generate.py) 展示了 Python API 的用法。
 
 ## 工作原理
+
+一条 **KV 行（row）**包含一个 token 在当前层所有 KV heads 的 K 和 V。连续的若干行组成一个**逻辑页**，按 token 在序列中的位置编号；**物理块**则是 GPU 池中实际分配的存储位置。地址解析器（row resolver）负责把逻辑 token ID 转换为当前可读的 GPU 行地址。
 
 ```text
 logical tokens → resident lookup → hot lookup → miss plan
@@ -56,8 +58,18 @@ logical tokens → resident lookup → hot lookup → miss plan
 
 - **稳定的历史地址。** 逻辑页保留主存地址，其 GPU 物理块可以重新分配。新增 KV 先追加到驻留尾页，再镜像至主存。
 - **共享的容量池。** 每个请求的每一层预留 hot 区域额度和两个活跃尾页块。历史页可借用尚未使用的容量，压力出现后再完整分配 hot 区域。
-- **安全的空间复用。** 已完成主存镜像的历史页在变为可回收状态后仍可读取，直到物理块实际复用时才撤销驻留映射。租约、代次与 CUDA 事件共同保护读者和在途拷贝。
-- **按行替换。** 地址解析器先保护本步所有命中的 hot 行，再按 LRU 为缺失行选择替换位置。GQA 的多个头共享已加载的数据行，同时保留各自的选择掩码。
+- **安全的空间复用。** 已完成主存镜像的历史页在变为可回收状态后仍可读取，直到物理块实际复用时才撤销驻留映射。下面的租约、代次与 CUDA 事件分别约束使用权、校验地址是否过期、保证异步操作顺序。
+- **按行替换。** 地址解析器先保护本步所有命中的 hot 行，再按最近最少使用策略（LRU）从其余行中优先替换最久未访问的行。分组查询注意力（GQA）允许多个 query heads 共用一个 KV head；这些头可复用已加载的数据行，同时保留各自的选择掩码，即每个头实际允许读取哪些 token。
+
+空间复用时，CPU 代码已经返回并不代表 GPU 已经读完数据，因此需要以下三种配合：
+
+| 术语 | 在本项目中的含义与作用 |
+|---|---|
+| **租约（lease）** | 由代码显式获取和释放的一段使用权。一次 attention 的行租约会保护相关驻留页，并将该层 hot 内容标记为正在使用，阻止管理器在这段期间改写其映射或替换内容。释放时记录本次 GPU 使用结束的事件。 |
+| **代次（generation）** | 物理块每次重新绑定用途时递增的版本号。引用同时记录块号、代次和所有者，使用或释放时进行校验，防止旧引用把同一地址的新内容当成原来的数据。 |
+| **CUDA 事件（event）** | 插入 GPU 执行流中的完成标记；执行流是按顺序提交操作的队列。attention 要等待加载完成，后续覆盖写入要等待前一次读取完成。租约在 CPU 上释放后，事件仍保护尚未完成的 GPU 操作。 |
+
+例如，attention 正在读取“物理块 7、代次 3”。它释放租约时记录事件 E；该块随后重新绑定，代次变为 4。新用途的写入必须等待 E，防止覆盖仍在读取的数据；持有代次 3 的旧引用也会在校验时被拒绝。这分别解决了“何时可以覆盖”和“引用是否仍有效”两个问题。
 
 设每页容纳 `P` 个 tokens，每层 hot 容量为 `H` 行，模型层数为 `L`，本步选中 token 的最大并集大小为 `U`：
 
@@ -72,7 +84,7 @@ H >= U
 
 ## Token-row 轨迹与局部性
 
-trace 示例把**选择哪些 token**与**如何缓存这些 token 的 KV 行**分开：将每个 head 的 token ID 直接交给 `Selection.from_tokens`，执行真实的 row resolver 和 attention，并逐步与相同选择下的参考结果做数值对照。
+trace 是按 decode 步骤记录的访问轨迹，包含各 head 选择的 token ID 及回放所需的 Q/K/V。这个示例把**选择哪些 token**与**如何缓存这些 token 的 KV 行**分开：将每个 head 的 token ID 直接交给 `Selection.from_tokens`，执行真实的 row resolver 和 attention，并逐步与相同选择下的参考结果做数值对照。
 
 ```text
 各 head 的 token ID → 去重后的行并集 → resident / hot 命中 / miss
@@ -118,7 +130,7 @@ H=4 和 H=8 分别使用三个和四个 device blocks，这里比较的是 hot �
 
 ### 从模型采集 token 级 trace
 
-采集器记录**使用完整 attention 的模型某一层**的 Q 和增量 K/V，再离线按每个 query head 的精确 QK 分数选择历史 token。`--tokens-per-head 8` 选择八个 **token**，不展开整页，也不强制加入 sink/tail token。这个 oracle 需要读取全部 K，用于获得 trace；它不是 learned DSA indexer，也不是高效的在线选择器。模型仍使用完整 attention，因此更改 oracle 预算不会改变生成轨迹。
+采集器记录**使用完整 attention 的模型某一层**的 Q 和增量 K/V，再离线按每个 query head 的精确 QK 分数选择历史 token。`--tokens-per-head 8` 选择八个 **token**，不展开整页，也不强制加入 sink/tail token。这种离线参考计算（oracle）需要读取全部 K，用于获得 trace；它不是 learned DSA indexer，也不是高效的在线选择器。模型仍使用完整 attention，因此更改 oracle 预算不会改变生成轨迹。
 
 ```bash
 # 用随机小模型跑通采集与回放，无需下载权重。
@@ -127,8 +139,11 @@ python examples/row_trace.py capture --max-context 256 --steps 8 \
 python examples/row_trace.py replay results/tiny-rows.pt --output results/tiny-rows.json
 
 # 可选：从预训练 Qwen 的真实 Q/K 采集（需安装 .[models]）。
+# 固定输入文档的版本，使后续 README 修改不改变下面的实测条件。
+mkdir -p results
+git show b7176ea:README.zh-CN.md > results/trace-prompt.txt
 python examples/row_trace.py capture --model Qwen/Qwen2.5-0.5B-Instruct \
-  --device cuda:0 --prompt-file README.zh-CN.md --max-context 512 \
+  --device cuda:0 --prompt-file results/trace-prompt.txt --max-context 512 \
   --steps 32 --tokens-per-head 8 --layer 2 --output results/qwen-rows.pt
 python examples/row_trace.py replay results/qwen-rows.pt --device cuda:0 \
   --output results/qwen-rows.json
@@ -182,7 +197,7 @@ CI 在 Python 3.10 和 3.12 上运行 CPU 检查。有可用 GPU 时会运行 CU
 
 ## 实现范围
 
-当前实现采用单进程、单 GPU，顺序执行各请求。尚未实现连续批处理、张量并行、前缀共享、MLA/FP8、分块 prefill 或跨层预取。选择器包含 Python 侧控制逻辑，行地址解析器由多个 PyTorch 操作组成。主存行加载通过 SM 发起读取，不是拷贝引擎 DMA；独立的搬运流用于表达依赖关系，本身并不保证与 attention 重叠执行。
+当前实现采用单进程、单 GPU，顺序执行各请求。尚未实现连续批处理、张量并行、前缀共享、MLA/FP8、分块 prefill 或跨层预取。选择器包含 Python 侧控制逻辑，行地址解析器由多个 PyTorch 操作组成。主存行加载由 GPU 的计算单元（SM）运行内核发起读取，未使用专门的拷贝引擎直接搬运数据（DMA）；独立的搬运流用于表达依赖关系，本身并不保证与 attention 重叠执行。
 
 设计参考：[vLLM](https://github.com/vllm-project/vllm)、[SGLang](https://github.com/sgl-project/sglang)、[nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) 和 [Quest](https://github.com/mit-han-lab/Quest)。本仓库未直接收录上游实现代码。
 

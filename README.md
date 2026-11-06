@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A small inference engine for decoding with partially resident KV caches. Inspired by [HiSparse in vLLM](https://github.com/vllm-project/vllm/tree/abf98672ce7e822701f7a062bf240efb2c9900d1/vllm/v1/hisparse) and the compact organization of [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm).
 
-The full KV history has host backing. Resident pages and reusable hot buffers share **one GPU tensor**. Each decode step reads resident rows directly and loads only missing selected rows from host memory. A request keeps generating after its historical pages are evicted, without restoring the entire KV cache or repeating prefill.
+The full KV history has host backing. Resident pages are KV pages still stored on the GPU; a hot buffer is reusable GPU space for temporarily loading rows from evicted pages. They share **one GPU tensor**. Each decode step reads resident rows directly and loads only missing selected rows from host memory. A request keeps generating after its historical pages are evicted, without restoring the entire KV cache or repeating prefill.
 
 ## Quick start
 
@@ -22,7 +22,7 @@ python -m pip install -e '.[dev]'
 nano-hisparse demo --device cpu
 ```
 
-The demo uses random model weights and reports execution counters, not meaningful text. Its default KV pool holds one request's minimum hot/tail footprint. Three longer prompts take turns through admission; each is prefilled once and decoded incrementally.
+The demo uses random model weights and reports execution counters, not meaningful text. Its default KV pool holds one request's hot buffer and two active tail blocks, which protect the end of the sequence where KV is appended. Admission reserves enough GPU, host and index capacity before allowing a request to start. Three longer prompts take turns; each is prefilled once and decoded incrementally.
 
 With CUDA-enabled PyTorch installed:
 
@@ -41,9 +41,11 @@ nano-hisparse generate --model Qwen/Qwen2.5-0.5B-Instruct \
   --prompt 'Explain how a KV cache works.' --top-k 4 --max-new-tokens 64
 ```
 
-The first run downloads weights. `--top-k 4` is a **page budget**: the Quest-style selector scores page min/max key bounds, keeps the sink and tail within the budget, and expands the chosen pages to all their valid tokens. With the default 16-token pages, four pages cover up to 64 tokens per query head. The cache itself resolves and loads individual token rows; the token-level trace example below exercises that finer granularity directly. `--top-k all` uses full attention and reserves a correspondingly larger working set. Sparse selection can change model outputs; it is separate from storage correctness. [examples/generate.py](examples/generate.py) shows the Python API.
+The first run downloads weights. `--top-k 4` is a **page budget**: the Quest-style selector scores page min/max key bounds, keeps the sink (first page) and tail (current last page) within the budget, and expands the chosen pages to all their valid tokens. With the default 16-token pages, four pages cover up to 64 tokens per query head. The cache itself resolves and loads individual token rows; the token-level trace example below exercises that finer granularity directly. `--top-k all` uses full attention and reserves a correspondingly larger working set. Sparse selection can change model outputs; it is separate from storage correctness. [examples/generate.py](examples/generate.py) shows the Python API.
 
 ## How it works
+
+A **KV row** contains one token's K and V across all KV heads in the current layer. Consecutive rows form a **logical page**, numbered by their positions in the sequence; a **physical block** is an actual allocation in the GPU pool. The **row resolver** translates logical token IDs into GPU row addresses that can currently be read.
 
 ```text
 logical tokens → resident lookup → hot lookup → miss plan
@@ -55,9 +57,19 @@ logical tokens → resident lookup → hot lookup → miss plan
 ```
 
 - **Stable history.** Logical pages retain a host address while their device blocks can be reassigned. New KV is appended to resident tail pages and mirrored to host.
-- **Shared capacity.** Every request/layer reserves a hot-region credit and two active tail blocks. History borrows unused capacity until pressure triggers a complete hot allocation.
-- **Safe reuse.** Clean historical pages remain readable until actual block reuse revokes their mapping. Leases, generations and CUDA events protect readers and in-flight copies.
-- **Row replacement.** The resolver protects all selected hot hits before choosing LRU victims for misses. GQA heads share loaded rows while preserving their individual selection masks.
+- **Shared capacity.** Every request/layer reserves capacity for a hot region and two active tail blocks. History borrows unused capacity until pressure triggers a complete hot allocation.
+- **Safe reuse.** Historical pages with up-to-date host copies remain readable until actual block reuse revokes their mapping. The leases, generations and CUDA events below govern usage rights, detect stale references and order asynchronous operations.
+- **Row replacement.** The resolver protects all selected hot hits, then uses least recently used (LRU) replacement to evict the longest-unused remaining rows. Grouped-query attention (GQA) lets multiple query heads share one KV head. Those heads reuse loaded rows while retaining individual selection masks, which specify which tokens each head may read.
+
+Returning from CPU code does not mean the GPU has finished reading data. Safe reuse therefore combines three mechanisms:
+
+| Term | Meaning and role in this project |
+|---|---|
+| **Lease** | A usage right explicitly acquired and released by code. An attention row lease protects the relevant resident pages and marks the layer's hot contents as busy, preventing the manager from changing their mappings or replacing their contents during that scope. Release records an event marking the end of the GPU use. |
+| **Generation** | A version counter incremented whenever a physical block is bound to a new use. References retain the block number, generation and owner; validation on use or release rejects stale references that would otherwise mistake new contents at the same address for old data. |
+| **CUDA event** | A completion marker inserted into a GPU stream, an ordered queue of operations. Attention waits for loading to finish, and subsequent overwrites wait for earlier reads. Events continue to protect pending GPU operations after the CPU releases a lease. |
+
+For example, attention reads block 7 at generation 3. Releasing its lease records event E; rebinding the block increments its generation to 4. Writes for the new use must wait for E to avoid overwriting data still being read. A reference carrying generation 3 also fails validation. These checks address both when an overwrite is safe and whether a reference is still valid.
 
 For page size `P`, hot rows `H`, layers `L` and maximum selected token union `U`:
 
@@ -72,7 +84,7 @@ minimum device blocks per request = L * (ceil(H / P) + 2)
 
 ## Token-row traces and locality
 
-The trace example separates **which tokens are selected** from **how their KV rows are cached**. It feeds per-head token IDs directly into `Selection.from_tokens`, runs the real row resolver and attention, and checks every output against a reference using exactly the same selection.
+A trace records accesses by decode step: each head's token IDs and the Q/K/V needed for replay. This example separates **which tokens are selected** from **how their KV rows are cached**. It feeds per-head token IDs directly into `Selection.from_tokens`, runs the real row resolver and attention, and checks every output against a reference using exactly the same selection.
 
 ```text
 per-head token IDs → deduplicated union → resident / hot hit / miss
@@ -118,7 +130,7 @@ The H=4 and H=8 runs use three and four device blocks respectively, isolating ho
 
 ### Capture a model's token-level trace
 
-Capture records Q and incremental K/V from **one layer of a dense teacher**, then ranks individual historical tokens by each query head's exact QK score. `--tokens-per-head 8` selects eight **tokens**, without expanding their pages or forcing sink/tail tokens. This oracle reads all keys offline; it is not a learned DSA indexer or an efficient online selector. The teacher continues using full attention, so changing the oracle budget does not change the generation trajectory.
+Capture records Q and incremental K/V from **one layer of a dense teacher**, then ranks individual historical tokens by each query head's exact QK score. `--tokens-per-head 8` selects eight **tokens**, without expanding their pages or forcing sink/tail tokens. This offline reference computation, or oracle, reads all keys; it is not a learned DSA indexer or an efficient online selector. The teacher continues using full attention, so changing the oracle budget does not change the generation trajectory.
 
 ```bash
 # Exercise capture/replay with the tiny random decoder, without downloading weights.
@@ -127,8 +139,11 @@ python examples/row_trace.py capture --max-context 256 --steps 8 \
 python examples/row_trace.py replay results/tiny-rows.pt --output results/tiny-rows.json
 
 # Optional: capture actual Q/K from pretrained Qwen (requires .[models]).
+# Pin the input document so later README edits do not change the measured setup.
+mkdir -p results
+git show b7176ea:README.zh-CN.md > results/trace-prompt.txt
 python examples/row_trace.py capture --model Qwen/Qwen2.5-0.5B-Instruct \
-  --device cuda:0 --prompt-file README.zh-CN.md --max-context 512 \
+  --device cuda:0 --prompt-file results/trace-prompt.txt --max-context 512 \
   --steps 32 --tokens-per-head 8 --layer 2 --output results/qwen-rows.pt
 python examples/row_trace.py replay results/qwen-rows.pt --device cuda:0 \
   --output results/qwen-rows.json
@@ -182,7 +197,7 @@ CI runs CPU checks on Python 3.10 and 3.12. CUDA cases run when a GPU is availab
 
 ## Scope
 
-This is a single-process, single-GPU implementation with sequential request execution. It does not implement continuous batching, tensor parallelism, prefix sharing, MLA/FP8, chunked prefill or cross-layer prefetch. The selector has Python-side control; the row resolver uses multiple PyTorch operations. Host gather uses SM-initiated loads, not copy-engine DMA. A transfer stream expresses dependencies but does not by itself guarantee overlap with attention.
+This is a single-process, single-GPU implementation with sequential request execution. It does not implement continuous batching, tensor parallelism, prefix sharing, MLA/FP8, chunked prefill or cross-layer prefetch. The selector has Python-side control; the row resolver uses multiple PyTorch operations. Host gather runs a kernel on the GPU compute units (SMs) to read host rows; it does not use the dedicated copy engine for direct memory access (DMA). A transfer stream expresses dependencies but does not by itself guarantee overlap with attention.
 
 Design references: [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang), [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), and [Quest](https://github.com/mit-han-lab/Quest). No upstream implementation is vendored.
 
