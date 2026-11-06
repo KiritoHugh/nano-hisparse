@@ -267,20 +267,44 @@ class HybridKVCache:
             self.storage.stats[f"hot_trigger_{reason}"] += 1
 
     def update_residency(self, request_id=None, layer=None, *, upcoming_allocation=False):
-        """Publish completed mirrors and retry explicit hot-region requests."""
+        """Nonblocking completion publication and persistent hot demand.
+
+        A per-layer resident-window cap substitutes for vLLM's scheduler-derived
+        in-flight token window. Before an append allocation, use projected free
+        capacity so that hot demand is raised before the last free block is used.
+        """
         self.storage.check_stream()
         self._publish_clean()
-        for group, tables in self.tables.items():
-            if request_id is not None and group[0] != request_id:
-                continue
-            if layer is not None and group[1] != layer:
-                continue
+        groups = [
+            g
+            for g in self.tables
+            if g[0] in self.storage.requests
+            and (request_id is None or g[0] == request_id)
+            and (layer is None or g[1] == layer)
+        ]
+        for group in groups:
             self._unpin_clean_pages(group)
+        for group in groups:
+            tables = self.tables[group]
+            residents = sum(
+                p.slot is not None for p in self.storage.pages.values() if p.key[:2] == group
+            )
+            if not residents:
+                continue
+            if not tables.hot_required:
+                free = len(self._available_blocks()) - int(upcoming_allocation)
+                if free < self.transition_watermark:
+                    self._require_hot(group, "watermark")
+                elif residents >= self.hot_config.resident_window_pages:
+                    self._require_hot(group, "window")
             if tables.hot_required and not tables.blocks and not tables.busy:
                 try:
                     self.transition_to_host(*group)
                 except CapacityError:
+                    # Allocation is retried at the next policy tick; a failed
+                    # attempt must not discard resident mappings or hot demand.
                     pass
+            self._unpin_clean_pages(group)
 
     def transition_to_host(self, request_id, layer):
         """Allocate the whole hot region atomically, then make history reclaimable."""
