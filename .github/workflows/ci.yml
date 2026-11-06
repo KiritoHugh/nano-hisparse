@@ -48,5 +48,6 @@ jobs:
           nano-hisparse demo --device cpu --max-new-tokens 3 --output results/demo.json
           python examples/inspect_indices.py --device cpu
           python examples/residency.py --device cpu
+          python examples/row_trace.py demo --device cpu --output results/row-locality.json
       - name: Build distributions
         run: python -m build
