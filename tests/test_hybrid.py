@@ -6,7 +6,7 @@ import torch
 from nano_hisparse.attention import row_attention
 from nano_hisparse.config import CacheConfig, CapacityError
 from nano_hisparse.hybrid import HotConfig, HybridKVCache
-from nano_hisparse.row_index import LogicalTopK
+from nano_hisparse.row_index import LogicalTopK, resolve_rows
 from nano_hisparse.selection import Selection, dense_attention, selection_oracle
 
 
@@ -170,6 +170,70 @@ def test_active_tail_and_row_lease_lifetime(device):
     cache.release_request("a")
     with pytest.raises(RuntimeError, match="released"):
         lease.wait()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_row_gather_attention_low_precision(dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    cache = make("cuda:0", dtype=dtype, page_size=7, head_dim=24, kv_heads=2)
+    cache.reserve("a", 100, 1)
+    k, v = write(cache, length=80)
+    q = torch.randn(6, 24, device="cuda", dtype=dtype)
+    selected = [0, 13, 39, 79]
+    actual = row_attention(q, cache, "a", 0, topk(cache, selected))
+    torch.testing.assert_close(
+        actual, dense_attention(q, k[selected], v[selected]), atol=0.004, rtol=0.02
+    )
+
+
+def test_device_resolver_supports_graph_capture_without_cpu_readback():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    cache = make("cuda:0")
+    cache.reserve("a", 40, 1)
+    write(cache)
+    tables = cache.tables["a", 0]
+    logical = topk(cache, [0, 4, 8, 31])
+
+    def resolve():
+        return resolve_rows(
+            logical, tables.source, tables.resident, tables.hot, tables.tags, tables.lru, 32, 4
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            resolve()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = resolve()
+    logical.positions.copy_(torch.tensor([1, 5, 9, 31], device="cuda", dtype=torch.int32))
+    graph.replay()
+    assert result.counts.tolist() == [1, 0, 3]
+
+
+def test_cuda_deferred_reuse_keeps_host_and_hot_readers_alive():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    cache = make("cuda:0", gpu_pages=3)
+    cache.reserve("same", 40, 1)
+    k, _ = write(cache, "same")
+    with cache.resolve("same", 0, topk(cache, [0, 4, 8, 31])) as lease:
+        torch.cuda._sleep(2_000_000)
+        row = lease.plan.physical_rows[0]
+        actual = cache.pool[row // 4, 0, row % 4].clone()
+    old_hosts = {p.host_slot for p in cache.storage.pages.values()}
+    cache.release_request("same", wait=False)
+    cache.reserve("same", 40, 1)
+    write(cache, "same")
+    if cache.storage.retired:
+        assert old_hosts.isdisjoint({p.host_slot for p in cache.storage.pages.values()})
+    torch.testing.assert_close(actual, k[0])
+    cache.release_request("same")
+    cache.assert_invariants()
 
 
 def test_randomized_requests_layers_append_and_row_replacement(device):

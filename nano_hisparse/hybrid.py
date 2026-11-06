@@ -126,6 +126,10 @@ class HybridKVCache:
             raise ValueError("host row tags require int32 addresses")
         self.row_stats = torch.zeros(3, dtype=torch.int64, device=self.device)
         self._host_pointer = None
+        if self.storage.cuda:
+            from .row_kernels import MappedHost
+
+            self._host_pointer = MappedHost(self.storage.host)
 
     @property
     def index_bytes(self):
@@ -454,13 +458,18 @@ class HybridKVCache:
             # Append mirrors and every earlier spill already precede us on
             # this single transfer stream. The gather reads only valid host KV.
             with self.storage.context(self.storage.transfer):
-                for host, device in zip(
-                    plan.miss_host_rows.tolist(), plan.miss_device_rows.tolist()
-                ):
-                    if host >= 0:
-                        hb, ho = divmod(host, self.config.page_size)
-                        db, do = divmod(device, self.config.page_size)
-                        self.pool[db, :, do].copy_(self.storage.host[hb, :, ho])
+                if self.storage.cuda:
+                    from .row_kernels import gather_rows
+
+                    gather_rows(self._host_pointer, self.pool, plan, self.config)
+                else:
+                    for host, device in zip(
+                        plan.miss_host_rows.tolist(), plan.miss_device_rows.tolist()
+                    ):
+                        if host >= 0:
+                            hb, ho = divmod(host, self.config.page_size)
+                            db, do = divmod(device, self.config.page_size)
+                            self.pool[db, :, do].copy_(self.storage.host[hb, :, ho])
             tables.ready = self.storage.event(self.storage.transfer)
             # Plan tensors are produced on compute but consumed on transfer.
             if self.storage.cuda:

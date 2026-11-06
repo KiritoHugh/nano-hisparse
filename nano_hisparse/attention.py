@@ -5,7 +5,7 @@ import torch
 
 @torch.inference_mode()
 def row_attention(query, cache, request_id, layer, topk, backend="auto"):
-    if backend not in ("auto", "torch"):
+    if backend not in ("auto", "torch", "triton"):
         raise ValueError("invalid attention backend")
     if query.ndim != 2 or query.shape[1] != cache.config.head_dim:
         raise ValueError("invalid query shape")
@@ -13,10 +13,16 @@ def row_attention(query, cache, request_id, layer, topk, backend="auto"):
         raise ValueError("query GQA/device mismatch")
     if topk.head_columns is not None and topk.head_columns.shape[0] != query.shape[0]:
         raise ValueError("selection must have one row per query head")
+    if backend == "triton" and not cache.storage.cuda:
+        raise ValueError("Triton requires CUDA")
     with cache.resolve(request_id, layer, topk) as lease:
         rows = lease.plan.physical_rows
         if rows.ndim == 1:
             rows = rows[None, :].expand(query.shape[0], -1)
+        if backend == "triton" or (backend == "auto" and cache.storage.cuda):
+            from .row_kernels import attend_rows
+
+            return attend_rows(query, cache.pool, rows, cache.config)
         safe = rows.clamp(min=0)
         blocks, offsets = safe // cache.config.page_size, safe % cache.config.page_size
         head = torch.arange(query.shape[0], device=query.device)
