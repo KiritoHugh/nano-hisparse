@@ -29,9 +29,6 @@ class DeviceAllocator:
         self.occupancy = Counter()
         self.budget = config.gpu_pages
 
-    def touch(self, key):
-        self.lru.move_to_end(key)
-
     def bind(self, slot, key):
         assert slot in self.free and slot < self.budget
         self.free.remove(slot)

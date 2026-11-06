@@ -23,7 +23,6 @@ PageKey = tuple[str, int, int]
 class Location(str, Enum):
     HOST = "host"
     RESIDENT = "resident"
-    HOT = "hot"
 
 
 @dataclass
@@ -42,7 +41,6 @@ class Page:
     host_enqueued_version: int = 0
     host_committed_version: int = 0
     sealed: bool = False
-    last_attention_epoch: int = -1000000000
 
 
 @dataclass
@@ -435,7 +433,7 @@ class HostStore:
                 assert page.location == Location.HOST
             else:
                 assert self.owners[page.slot] == key
-                assert page.location in (Location.RESIDENT, Location.HOT)
+                assert page.location == Location.RESIDENT
             assert page.pins == 0 or page.slot is not None
             assert page.request_generation == self.requests[key[0]].generation
             assert page.host_committed_version <= page.host_enqueued_version == page.content_version

@@ -63,19 +63,6 @@ class Selection:
     def pages(self):
         return sorted({t // self.page_size for row in self.positions for t in row})
 
-    def mask(self, pages, device):
-        # Bounded mask: query_heads × window_pages × page_size, never full KV.
-        selected = [set(row) for row in self.positions]
-        mask = torch.tensor(
-            [
-                [[p * self.page_size + t in row for t in range(self.page_size)] for p in pages]
-                for row in selected
-            ],
-            dtype=torch.bool,
-            pin_memory=device.type == "cuda",
-        )
-        return mask.to(device, non_blocking=device.type == "cuda")
-
 
 def quest_selection(query, minimum, maximum, length, page_size, top_pages, keep_sink=True):
     """Quest-style per-head bounds; explicit GQA page union, not native DSA.
