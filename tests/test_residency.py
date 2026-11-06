@@ -277,3 +277,26 @@ def test_pressure_waits_only_for_an_eligible_mirror_event():
     cache.storage.wait = original_wait
     cache.release_request("a")
     cache.assert_invariants()
+
+
+def test_allocation_revisits_a_group_whose_mirror_was_published_late(monkeypatch):
+    cache = make("cpu", pages=4)
+    cache.reserve("a", 64, 1)
+    write(cache, "a", 12)
+    cache.transition_to_host("a", 0)
+    page = cache.storage.pages["a", 0, 0]
+    slot = page.slot
+    cache.allocator.reclaimable.pop(slot)
+    page.host_committed_version = 0
+    assert not cache.allocator.free
+
+    # A later group's transition may publish this page after the policy loop
+    # has already visited A. Allocation must revisit the newly clean page.
+    def publish_after_policy_visit(**kwargs):
+        page.host_committed_version = page.content_version
+
+    monkeypatch.setattr(cache, "update_residency", publish_after_policy_visit)
+    assert cache._slot() == slot
+    assert page.slot is None
+    assert cache.tables["a", 0].resident[0].item() == -1
+    cache.assert_invariants()

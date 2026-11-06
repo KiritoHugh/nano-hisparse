@@ -350,10 +350,22 @@ class HybridKVCache:
     def _slot(self):
         while True:
             self.update_residency(upcoming_allocation=True)
+            # A later group's transition can publish mirrors for a group that
+            # the policy loop already visited. Refresh their reclaimability
+            # before concluding that the shared pool has no usable blocks.
+            for group in self.tables:
+                self._unpin_clean_pages(group)
             free = self._available_blocks()
             if free:
                 return self._take_block(free[0])
             candidates = self._historical_pages()
+            # Keep this snapshot across transition attempts: those attempts may
+            # publish a completion without yet making its old block allocatable.
+            pending = [
+                p
+                for p in candidates
+                if p.host_committed_version < p.content_version and p.host_ready is not None
+            ]
             counts = Counter(p.key[:2] for p in candidates)
             for group, count in counts.most_common():
                 if count >= self.hot_blocks + 1 and not self.tables[group].blocks:
@@ -365,11 +377,6 @@ class HybridKVCache:
                     free = self._available_blocks()
                     if free:
                         return self._take_block(free[0])
-            pending = [
-                p
-                for p in candidates
-                if p.host_committed_version < p.content_version and p.host_ready is not None
-            ]
             if not pending:
                 raise CapacityError("no reclaimable resident block; tails/readers are protected")
             # Synchronous teaching runner cannot suspend midway through prefill.
