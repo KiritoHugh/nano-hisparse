@@ -47,8 +47,9 @@ def test_row_locality_counts(device, pattern, capacity, hits, misses, row_j, pag
         }[pattern]
     )
     for event in report["events"]:
-        # Heads overlap: five head/token pairs cause only four row accesses.
-        assert sum(map(len, event["positions"])) == 5
+        # All query heads share the same four selected token rows.
+        assert len(event["positions"]) == 4
+        assert event["positions"] == tuple(event["union_rows"])
         assert event["hot_hits"] + event["misses"] == 4
         assert set(event["union_rows"]) <= set(event["hot_slots"])
     if pattern == "alternating" and capacity == 8:
@@ -58,8 +59,8 @@ def test_row_locality_counts(device, pattern, capacity, hits, misses, row_j, pag
 def test_token_ranking_selects_rows_without_expanding_pages():
     keys = torch.zeros(16, 1, 2)
     keys[[0, 4, 8, 12], 0, 0] = torch.tensor([4.0, 3, 2, 1])
-    keys[[1, 5, 9, 13], 0, 1] = torch.tensor([4.0, 3, 2, 1])
-    assert token_topk(torch.eye(2), keys, 4) == [[0, 4, 8, 12], [1, 5, 9, 13]]
+    keys[[1, 5, 9, 13], 0, 1] = torch.tensor([3.5, 2.5, 1.5, 0.5])
+    assert token_topk(torch.eye(2), keys, 4) == [0, 1, 4, 5]
 
 
 def test_trace_roundtrip_and_invalid_input(tmp_path):
@@ -69,7 +70,7 @@ def test_trace_roundtrip_and_invalid_input(tmp_path):
     loaded = load_trace(path)
     assert replay_trace(loaded, 8) == replay_trace(trace, 8)
     invalid = copy.deepcopy(trace)
-    invalid["events"][0]["positions"][0] = [65]
+    invalid["events"][0]["positions"][0] = 65
     with pytest.raises(ValueError, match="noncausal"):
         validate_trace(invalid)
     invalid = copy.deepcopy(trace)
@@ -78,6 +79,22 @@ def test_trace_roundtrip_and_invalid_input(tmp_path):
         validate_trace(invalid)
     with pytest.raises(ValueError):
         replay_trace(trace, 3)
+    invalid = copy.deepcopy(trace)
+    invalid["events"][0]["positions"] = [[0, 4], [8, 12]]
+    with pytest.raises(ValueError, match="one shared"):
+        validate_trace(invalid)
+
+
+def test_legacy_per_head_trace_preserves_masks_and_capacity():
+    trace = synthetic_trace("reuse")
+    trace["schema_version"] = 1
+    for event in trace["events"]:
+        event["positions"] = [[0, 4, 8], [4, 12]]
+    report = replay_trace(trace)
+    assert report["schema_version"] == 1
+    assert report["max_union_rows"] == 4
+    assert report["events"][0]["positions"] == ((0, 4, 8), (4, 12))
+    assert report["summary"]["misses"] == 4
 
 
 def test_capture_records_real_queries_and_preserves_dense_trajectory(tmp_path):
@@ -121,5 +138,7 @@ def test_capture_records_real_queries_and_preserves_dense_trajectory(tmp_path):
     save_trace(trace, tmp_path / "model.pt")
     report = replay_trace(load_trace(tmp_path / "model.pt"))
     assert report["summary"]["misses"] > 0
-    assert report["max_union_rows"] <= 2 * 4
+    assert report["max_union_rows"] == 2
+    assert report["source"]["token_budget_per_query"] == 2
+    assert trace["schema_version"] == 2
     assert report["source"]["kind"] == "dense_teacher_token_oracle"

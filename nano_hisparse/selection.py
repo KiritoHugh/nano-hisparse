@@ -10,6 +10,8 @@ import torch
 
 @dataclass(frozen=True)
 class Selection:
+    """One shared token set by default; explicit per-head rows remain supported."""
+
     positions: tuple[tuple[int, ...], ...]  # per query head, canonical logical tokens
     length: int
     page_size: int
@@ -65,10 +67,10 @@ class Selection:
 
 
 def quest_selection(query, minimum, maximum, length, page_size, top_pages, keep_sink=True):
-    """Quest-style per-head bounds; explicit GQA page union, not native DSA.
+    """Quest-style bounds averaged across heads before one shared page top-k.
 
     max(q_d * min(K_d), q_d * max(K_d)) upper-bounds each page's qK.
-    Each head selects independently; the cache transfers the UNION of pages.
+    This shared-selection demonstration is not a learned DSA/QSA indexer.
     """
     count = ceil(length / page_size)
     if top_pages < 1 or query.shape[0] % minimum.shape[1]:
@@ -80,10 +82,11 @@ def quest_selection(query, minimum, maximum, length, page_size, top_pages, keep_
     low = minimum[:count].repeat_interleave(groups, 1).transpose(0, 1).float()
     high = maximum[:count].repeat_interleave(groups, 1).transpose(0, 1).float()
     scores = torch.maximum(query.float()[:, None] * low, query.float()[:, None] * high).sum(-1)
+    scores = scores.mean(0)
     required = [count - 1]
     if keep_sink and top_pages > 1 and count > 1:
         required.append(0)
-    scores[:, required] = torch.inf
+    scores[required] = torch.inf
     chosen = scores.topk(top_pages, dim=-1).indices.tolist()
     return Selection.from_pages(chosen, length, page_size, heads, "quest")
 

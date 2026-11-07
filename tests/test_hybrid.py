@@ -93,7 +93,8 @@ def test_late_hits_are_protected_and_lru_replaces_only_unselected_rows(device):
     cache.assert_invariants()
 
 
-def test_per_head_token_masks_and_noncontiguous_hot_blocks(device):
+@pytest.mark.parametrize("shared", [True, False])
+def test_shared_and_legacy_token_masks_with_noncontiguous_hot_blocks(device, shared):
     config = CacheConfig(
         gpu_pages=8, host_pages=64, page_size=3, kv_heads=2, head_dim=8, device=device
     )
@@ -111,7 +112,8 @@ def test_per_head_token_masks_and_noncontiguous_hot_blocks(device):
     write(cache, "a", 18)
     k, v = [x.to(device) for x in cache.storage.host_kv("a", 0)]
     q = torch.randn(4, 8, device=device)
-    selection = Selection.from_tokens([[0, 7], [2], [7, 11], [19, 0]], 27, 3, 4)
+    positions = [0, 2, 7, 11, 19] if shared else [[0, 7], [2], [7, 11], [19, 0]]
+    selection = Selection.from_tokens(positions, 27, 3, 4)
     actual = cache.attention(q, "a", 0, selection=selection)
     expected, _ = selection_oracle(q, k, v, selection)
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)

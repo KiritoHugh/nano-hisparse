@@ -46,7 +46,7 @@ logical tokens → resident lookup → hot lookup → miss plan
 - **稳定的历史地址。** 逻辑页保留主存地址，其 GPU 物理块可以重新分配。新增 KV 先追加到驻留尾页，再镜像至主存。
 - **共享的容量池。** 每个请求的每一层预留 hot 区域额度和两个活跃尾页块。历史页可借用尚未使用的容量，压力出现后再完整分配 hot 区域。
 - **安全的空间复用。** 已完成主存镜像的历史页在变为可回收状态后仍可读取，直到物理块实际复用时才撤销驻留映射。下面的租约、代次与 CUDA 事件分别约束使用权、校验地址是否过期、保证异步操作顺序。
-- **按行替换。** 地址解析器先保护本步所有命中的 hot 行，再按最近最少使用策略（LRU）从其余行中优先替换最久未访问的行。分组查询注意力（GQA）允许多个 query heads 共用一个 KV head；这些头可复用已加载的数据行，同时保留各自的选择掩码，即每个头实际允许读取哪些 token。
+- **按行替换。** 地址解析器先保护本步所有命中的 hot 行，再按最近最少使用策略（LRU）从其余行中优先替换最久未访问的行。分组查询注意力（GQA）允许多个 query heads 共用一个 KV head；同一 query 的所有 attention heads 使用同一组被选中的 token ID，各 head 仍读取对应 KV head 的数据，并独立计算 attention 权重。
 
 空间复用时，CPU 代码已经返回并不代表 GPU 已经读完数据，因此需要以下三种配合：
 
@@ -58,16 +58,18 @@ logical tokens → resident lookup → hot lookup → miss plan
 
 例如，attention 正在读取“物理块 7、代次 3”。它释放租约时记录事件 E；该块随后重新绑定，代次变为 4。新用途的写入必须等待 E，防止覆盖仍在读取的数据；持有代次 3 的旧引用也会在校验时被拒绝。这分别解决了“何时可以覆盖”和“引用是否仍有效”两个问题。
 
-设每页容纳 `P` 个 tokens，每层 hot 容量为 `H` 行，模型层数为 `L`，本步选中 token 的最大并集大小为 `U`：
+设每页容纳 `P` 个 tokens，每层 hot 容量为 `H` 行，模型层数为 `L`，每个 query 选中的不同 token 数上限为 `U`：
 
 ```text
 H >= U
 每个请求的最小 GPU 块数 = L * (ceil(H / P) + 2)
 ```
 
-`U` 按所有 query heads 的选择并集计算，而非单个头的选择宽度。默认使用 `H = 2U`，`H = U` 也能保证持续前进。扩大 hot 区域会减少可用于历史页驻留的空间。准入时还会预留主存后备存储和索引容量。
+`U` 按共享选择计数，不乘 head 数；页选择器按展开后的 token 行数计数，并包含额外强制选中的 sink/tail tokens。配置字段 `max_union_rows` 保留旧名称，CLI 使用 `--max-selected-rows`（兼容别名 `--max-union-rows`）。默认使用 `H = 2U`，`H = U` 也能保证持续前进。扩大 hot 区域会减少可用于历史页驻留的空间。准入时还会预留主存后备存储和索引容量。
 
 `--gpu-pages` 只限制持久 KV 池的大小，模型权重、索引、激活和 prefill 工作区还需额外显存。运行 `nano-hisparse demo --help` 可查看配置选项。
+
+默认接口语义是**每个 query token 一组选择结果，由所有 attention heads 共用**。[DeepSeek DSA](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py) 选择单个 token；[Qwen QSA](https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf) 选择 micro-block（Flash-Next 最多选 512 个完整的四-token 块，并额外包含未满尾块）。选择粒度与是否跨 head 共享是两个维度。本项目使用共享的 Quest 风格页启发式和离线平均 QK token 参考选择器，并未实现 DSA/QSA 的 learned indexer。显式逐 head `Selection` 输入仍用于兼容和诊断；默认生成与新 trace 均使用共享 ID。
 
 ## 两种验证方式
 
@@ -96,7 +98,7 @@ nano-hisparse generate --model Qwen/Qwen2.5-0.5B-Instruct \
   --output results/generation.json
 ```
 
-首次运行会下载权重。`--top-k 4` 是**页预算**：Quest 风格选择器通过页内 K 的 min/max 边界评分，将 sink 页（序列第一页）和尾页（当前最后一页）计入预算，再把选中页展开为页内全部有效 token。默认每页 16 个 token，四页对应每个 query head 最多 64 个 token。缓存本身按 token row 解析和加载，下文的 row trace 示例直接验证这个更细的粒度。`--top-k all` 使用完整 attention，并预留相应更大的工作集。稀疏选择可能改变模型输出，其近似误差与缓存存储是否正确是两个独立问题。[examples/generate.py](examples/generate.py) 展示了 Python API 的用法。
+首次运行会下载权重。`--top-k 4` 是**页预算**：Quest 风格选择器先对各 query head 的页内 K min/max 边界分数取平均，再执行一次共享 top-k，将 sink 页（序列第一页）和尾页（当前最后一页）计入预算，再把选中页展开为页内全部有效 token。默认每页 16 个 token，四页对应每个 query 最多 64 个不同 token，由所有 heads 共用。缓存本身按 token row 解析和加载，下文的 row trace 示例直接验证这个更细的粒度。`--top-k all` 使用完整 attention，并预留相应更大的工作集。稀疏选择可能改变模型输出，其近似误差与缓存存储是否正确是两个独立问题。[examples/generate.py](examples/generate.py) 展示了 Python API 的用法。
 
 运行后查看 `results/generation.json`：`outputs` 是生成文本，`requests` 记录每个请求的 `prefill_count`、`decode_count` 和生成长度，`cache` 包含缓存计数。它们展示完整调用流程和实际缓存访问；是否发生历史页卸载取决于输入长度与容量配置，生成文本本身也不足以证明缓存数值正确或具有 row locality。下面的固定轨迹回放用于进一步检查这些性质。
 
@@ -104,19 +106,19 @@ nano-hisparse generate --model Qwen/Qwen2.5-0.5B-Instruct \
 
 这个入口固定访问序列，观察同一批 token 行如何在驻留区、主存和 hot buffer 之间被读取与复用。先用受控模式检查预期的命中和替换行为，再从真实模型 Q/K 采集轨迹，测量该样本中的 row locality。回放会执行真实的按行加载与 attention，并与相同选择下的参考输出对照，检查缓存处理是否改变计算结果。
 
-trace 是按 decode 步骤记录的访问轨迹，包含各 head 选择的 token ID 及回放所需的 Q/K/V。回放把这些 token ID 直接交给 `Selection.from_tokens`，保留各 head 独立的选择，并据此解析行地址：
+trace 是按 decode 步骤记录的访问轨迹，包含每个 query 的一组共享 token ID 及回放所需的 Q/K/V。回放把这些 token ID 直接交给 `Selection.from_tokens`，所有 attention heads 使用相同的选中位置：
 
 ```text
-各 head 的 token ID → 去重后的行并集 → resident / hot 命中 / miss
-                                                   ↓
-                                          只加载缺失 KV 行
-                                                   ↓
-                                        保留各 head 掩码的 attention
+共享的 token ID → resident / hot 命中 / miss
+                              ↓
+                     只加载缺失 KV 行
+                              ↓
+                 各 head 在同一组 token 上计算 attention
 ```
 
 #### 用受控访问验证 row 管理
 
-无需下载模型。输出 JSON 包含每步各 head 的选择、row/page 并集、hot 槽位内容、命中、缺失和数值误差。
+无需下载模型。输出 JSON 包含每步的共享选择、选中行及所在页、hot 槽位内容、命中、缺失和数值误差。
 
 ```bash
 python examples/row_trace.py demo --device cpu --output results/row-locality.json
@@ -124,7 +126,7 @@ python examples/row_trace.py demo --device cpu --output results/row-locality.jso
 python examples/row_trace.py demo --device cuda:0 --output results/row-locality-cuda.json
 ```
 
-每条轨迹包含八步 decode，每步选中行的并集为四行，每页四个 token。hot 从空缓存开始，历史页已卸载，保留两个受保护的尾页。两个 query head 重复选择其中一个 token，因此五个 head/token 组合只需访问四条 KV 记录。这里一行包含该 token 所有 KV heads 的 K 和 V，共 64 字节。
+每条轨迹包含八步 decode，每步共享选择四行，每页四个 token。hot 从空缓存开始，历史页已卸载，保留两个受保护的尾页。两个 query head 关注同样的四个 token，每条 KV 行只解析和加载一次。这里一行包含该 token 所有 KV heads 的 K 和 V，共 64 字节。
 
 | 访问模式 | Hot 行数 H | Hot 命中 | Miss | 缺失行搬运量 | 平均 row J | 平均 page J | 页内密度 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -144,18 +146,18 @@ step 2:  rows 0,4,8,12    → pages 0,1,2,3
 
 虽然始终访问相同的页，H=4 时仍然每步全部 miss；H=8 能保留两组行，预热后便可命中。`streaming` 每步访问新行，即使 H=8 也没有复用。这些对照说明，仅凭 page 重合率不能判断 row locality。
 
-设第 t 步选中行并集为 `R_t`，其所在页集合为 `P_t`。row J 为 `|R_t ∩ R_(t-1)| / |R_t ∪ R_(t-1)|`，page J 将其中的集合替换为 `P_t`。表中对相邻步的 Jaccard 取平均，排除第一步。页内密度是选中行数除以选中页中的有效行数。JSON 还记录重复访问的平均步间隔，以及 `hot_hits / (hot_hits + misses)`；resident 命中单独计数。相邻步重合率不等于缓存命中率：交替访问的 row J 为零，但仍有间隔两步的复用。
+设第 t 步选中行集合为 `R_t`，其所在页集合为 `P_t`。row J 为 `|R_t ∩ R_(t-1)| / |R_t ∪ R_(t-1)|`，page J 将其中的集合替换为 `P_t`。表中对相邻步的 Jaccard 取平均，排除第一步。页内密度是选中行数除以选中页中的有效行数。JSON 还记录重复访问的平均步间隔，以及 `hot_hits / (hot_hits + misses)`；resident 命中单独计数。相邻步重合率不等于缓存命中率：交替访问的 row J 为零，但仍有间隔两步的复用。
 
 H=4 和 H=8 分别使用三个和四个 device blocks，这里比较的是 hot 容量影响，而非相同总显存下的优劣。搬运量只计算缺失行的 K/V 有效载荷，不含元数据与总线事务开销；CPU 运行模拟这部分字节数。诊断路径会同步并计算参考 attention，不用于延迟测量。受控模式验证缓存行为，不能据此宣称真实模型具有局部性。
 
 #### 从模型采集 token 级 trace
 
-采集器记录**使用完整 attention 的模型某一层**的 Q 和增量 K/V，再离线按每个 query head 的精确 QK 分数选择历史 token。`--tokens-per-head 8` 选择八个 **token**，不展开整页，也不强制加入 sink/tail token。这种离线参考计算（oracle）需要读取全部 K，用于获得 trace；它不是 learned DSA indexer，也不是高效的在线选择器。模型仍使用完整 attention，因此更改 oracle 预算不会改变生成轨迹。
+采集器记录**使用完整 attention 的模型某一层**的 Q 和增量 K/V，再离线对各 query head 的精确 QK 分数取平均，执行一次共享 top-k。`--tokens-per-query 8` 总共选择八个 **token**，不展开整页，也不强制加入 sink/tail token。这种离线参考计算（oracle）需要读取全部 K，用于获得 trace；它不是 learned DSA indexer，也不是高效的在线选择器。模型仍使用完整 attention，因此更改 oracle 预算不会改变生成轨迹。
 
 ```bash
 # 用随机小模型跑通采集与回放，无需下载权重。
 python examples/row_trace.py capture --max-context 256 --steps 8 \
-  --tokens-per-head 8 --output results/tiny-rows.pt
+  --tokens-per-query 8 --output results/tiny-rows.pt
 python examples/row_trace.py replay results/tiny-rows.pt --output results/tiny-rows.json
 
 # 可选：从预训练 Qwen 的真实 Q/K 采集（需安装 .[models]）。
@@ -164,14 +166,14 @@ mkdir -p results
 git show b7176ea:README.zh-CN.md > results/trace-prompt.txt
 python examples/row_trace.py capture --model Qwen/Qwen2.5-0.5B-Instruct \
   --device cuda:0 --prompt-file results/trace-prompt.txt --max-context 512 \
-  --steps 32 --tokens-per-head 8 --layer 2 --output results/qwen-rows.pt
+  --steps 32 --tokens-per-query 8 --layer 2 --output results/qwen-rows.pt
 python examples/row_trace.py replay results/qwen-rows.pt --device cuda:0 \
   --output results/qwen-rows.json
 ```
 
-`.pt` 文件保存冻结的 CPU Q/K/V 张量和 token 选择，以及模型名称、可获取的 revision、prompt token 哈希、层号与预算等来源信息。回放不需要模型权重；通过 `--hot-rows H` 可以在同一条 trace 上比较不同容量。默认 H 为所有步骤中最大的跨 head 行并集，而不是单个 head 的 token 预算。产物写入已忽略的 `results/` 目录。
+`.pt` 文件保存冻结的 CPU Q/K/V 张量和 token 选择，以及模型名称、可获取的 revision、prompt token 哈希、层号与预算等来源信息。回放不需要模型权重；通过 `--hot-rows H` 可以在同一条 trace 上比较不同容量。默认 H 为所有步骤中最大的共享选中行数。新 trace 使用 schema v2，以一维 `positions` 列表和 `token_budget_per_query` 元数据表示共享选择；schema v1 的逐 head trace 仍按原有掩码回放。JSON 中的 `union_rows`、`max_union_rows` 保留旧名称，表示不同的选中行。采集参数现为 `--tokens-per-query`，替代 `--tokens-per-head`。产物写入已忽略的 `results/` 目录。
 
-在 A100/BF16 上执行上述 Qwen 命令（层索引 2、512 个 prompt tokens、32 步、PyTorch 2.15.0），得到如下回放结果。prompt token 的 SHA-256 前缀为 `4a6e9d526559d6ce`；加载器未提供模型 revision，文件中记为 `null`。重复 replay 并添加 `--hot-rows 68` 即可比较第二种容量。
+**历史逐 head 基线（schema v1，共享选择修改之前）。** 在 A100/BF16 上使用旧版 `--tokens-per-head 8` 采集路径（层索引 2、512 个 prompt tokens、32 步、PyTorch 2.15.0），得到如下回放结果。这些数字不代表当前共享选择命令的结果；复现需要原始 v1 trace 或旧版代码。prompt token 的 SHA-256 前缀为 `4a6e9d526559d6ce`；加载器未提供模型 revision，文件中记为 `null`。重复 replay 并添加 `--hot-rows 68` 即可比较第二种容量。
 
 | Hot 行数 H | Device blocks | Resident 命中 | Hot 命中 | Miss | 缺失行搬运量 | Hot 命中率 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -211,7 +213,7 @@ CI 在 Python 3.10 和 3.12 上运行 CPU 检查。有可用 GPU 时会运行 CU
 | [allocator.py](nano_hisparse/allocator.py)、[storage.py](nano_hisparse/storage.py) | 物理块、逻辑页、主存镜像与延迟回收 |
 | [hybrid.py](nano_hisparse/hybrid.py) | 容量准入、驻留策略、hot 租约与行生命周期 |
 | [row_index.py](nano_hisparse/row_index.py)、[row_kernels.py](nano_hisparse/row_kernels.py) | 地址解析、按行加载与 attention 内核 |
-| [selection.py](nano_hisparse/selection.py)、[attention.py](nano_hisparse/attention.py) | 各头的 token 选择语义与 attention 分发 |
+| [selection.py](nano_hisparse/selection.py)、[attention.py](nano_hisparse/attention.py) | 共享 token 选择语义与 attention 分发 |
 | [trace.py](nano_hisparse/trace.py)、[row_trace.py](examples/row_trace.py) | 离线 token 采集、回放与局部性诊断 |
 | [model.py](nano_hisparse/model.py)、[engine.py](nano_hisparse/engine.py) | Transformer 执行与轮转请求调度 |
 

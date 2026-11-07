@@ -14,11 +14,14 @@ from .selection import Selection
 
 @dataclass(frozen=True)
 class LogicalTopK:
-    positions: torch.Tensor  # shared [K] token positions, or the union for GQA
-    head_columns: torch.Tensor | None = None  # [heads, K_head], -1 padding
+    positions: torch.Tensor  # shared [K] token positions
+    head_columns: torch.Tensor | None = None  # optional legacy per-head selection
 
     @classmethod
     def from_selection(cls, selection: Selection, device):
+        if all(row == selection.positions[0] for row in selection.positions):
+            return cls(torch.tensor(selection.positions[0], dtype=torch.int32, device=device))
+        # Compatibility for explicit per-head inputs; default selectors share IDs.
         union = sorted({p for row in selection.positions for p in row})
         columns = {token: i for i, token in enumerate(union)}
         width = max(map(len, selection.positions))

@@ -21,6 +21,8 @@ ACTIVE_TAIL_PAGES = 2  # vLLM snapshot: v1/hisparse/types.py
 
 @dataclass(frozen=True)
 class HotConfig:
+    """max_union_rows is the legacy name for the distinct selected-row bound."""
+
     max_union_rows: int
     hot_rows: int | None = None
     resident_window_pages: int = 64

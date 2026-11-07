@@ -12,12 +12,12 @@ from .selection import Selection, selection_oracle
 
 
 def token_topk(query, keys, count):
-    """Exact per-head QK ranking; reads ALL keys, so this is an offline oracle."""
+    """One top-k of mean head QK scores; offline reference, not a learned indexer."""
     if count < 1:
         raise ValueError("token count must be positive")
     groups = query.shape[0] // keys.shape[1]
     scores = torch.einsum("hd,thd->ht", query.float(), keys.repeat_interleave(groups, 1).float())
-    return scores.topk(min(count, len(keys)), dim=-1).indices.tolist()
+    return scores.mean(0).topk(min(count, len(keys)), dim=-1).indices.tolist()
 
 
 def synthetic_trace(pattern, steps=8, seed=42):
@@ -32,7 +32,7 @@ def synthetic_trace(pattern, steps=8, seed=42):
         return torch.randn(count, 1, 8, generator=rng)
 
     trace = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": {"kind": "synthetic", "pattern": pattern, "seed": seed},
         "page_size": 4,
         "prefill": {"k": kv(64), "v": kv(64)},
@@ -46,17 +46,15 @@ def synthetic_trace(pattern, steps=8, seed=42):
         else:
             offset = step % 2 if pattern == "alternating" else 0
             rows = [offset + base for base in (0, 4, 8, 12)]
-        # Two query heads overlap on one token; union contains exactly four rows.
-        positions = [rows[:3], [rows[1], rows[3]]]
         trace["events"].append(
-            {"q": torch.randn(2, 8, generator=rng), "k": kv(1), "v": kv(1), "positions": positions}
+            {"q": torch.randn(2, 8, generator=rng), "k": kv(1), "v": kv(1), "positions": rows}
         )
     return trace
 
 
 def validate_trace(trace):
-    if trace.get("schema_version") != 1 or not isinstance(trace.get("source"), dict):
-        raise ValueError("trace requires schema_version=1 and source metadata")
+    if trace.get("schema_version") not in (1, 2) or not isinstance(trace.get("source"), dict):
+        raise ValueError("trace requires schema_version=1 or 2 and source metadata")
     if not trace.get("events"):
         raise ValueError("trace needs at least one event")
     k, v = trace["prefill"]["k"], trace["prefill"]["v"]
@@ -80,6 +78,11 @@ def validate_trace(trace):
         ):
             raise ValueError("incompatible event Q/K/V")
         length += 1
+        if trace["schema_version"] == 2 and (
+            not isinstance(event["positions"], (list, tuple))
+            or any(not isinstance(t, int) for t in event["positions"])
+        ):
+            raise ValueError("schema_version=2 requires one shared token ID list per query")
         selection = Selection.from_tokens(
             event["positions"], length, trace["page_size"], q.shape[0]
         )
@@ -158,7 +161,9 @@ def replay_trace(trace, hot_rows=None, device="cpu"):
                 {
                     "step": step,
                     "length": len(k),
-                    "positions": selection.positions,
+                    "positions": selection.positions[0]
+                    if trace["schema_version"] == 2
+                    else selection.positions,
                     "union_rows": sorted(rows),
                     "selected_pages": sorted(pages),
                     "row_jaccard": _jaccard(rows, previous_rows),
@@ -192,6 +197,7 @@ def replay_trace(trace, hot_rows=None, device="cpu"):
             "max_abs_error": max(r["max_abs_error"] for r in records),
         }
         return {
+            "schema_version": trace["schema_version"],
             "source": trace["source"],
             "device": str(cache.device),
             "dtype": str(k.dtype),
@@ -217,7 +223,7 @@ def capture_trace(model, tokens, steps=8, token_budget=8, layer=0, page_size=16,
     if not tokens or steps < 1 or token_budget < 1 or not 0 <= layer < cfg.num_hidden_layers:
         raise ValueError("invalid capture prompt, steps, token budget or layer")
     trace = {
-        "schema_version": 1,
+        "schema_version": 2,
         "page_size": page_size,
         "prefill": {},
         "events": [],
@@ -225,7 +231,8 @@ def capture_trace(model, tokens, steps=8, token_budget=8, layer=0, page_size=16,
             **(source or {}),
             "kind": "dense_teacher_token_oracle",
             "layer": layer,
-            "token_budget_per_head": token_budget,
+            "token_budget_per_query": token_budget,
+            "selection": "shared_mean_qk",
             "prompt_tokens": len(tokens),
             "prompt_sha256": sha256(str(tokens).encode()).hexdigest(),
             "torch": str(torch.__version__),

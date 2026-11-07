@@ -37,14 +37,20 @@ def main():
         command.add_argument("--host-pages", type=_positive)
         command.add_argument("--page-size", type=_positive, default=16)
         command.add_argument("--hot-rows", type=_positive)
-        command.add_argument("--max-union-rows", type=_positive)
+        command.add_argument(
+            "--max-selected-rows",
+            "--max-union-rows",
+            dest="max_selected_rows",
+            type=_positive,
+            help="maximum distinct selected token rows per query (legacy alias: --max-union-rows)",
+        )
         command.add_argument("--index-budget-mib", type=_positive, default=64)
         command.add_argument("--backend", choices=["auto", "torch", "triton"], default="auto")
         command.add_argument(
             "--top-k",
             type=_top_k,
             default=2 if name == "demo" else None,
-            help="selected pages per head, or all",
+            help="shared selected pages per query token, or all",
         )
         command.add_argument("--max-new-tokens", type=_positive, default=12)
         command.add_argument("--output", type=Path)
@@ -89,13 +95,10 @@ def main():
 
     cfg = model.config
     maximum = max(map(len, prompts)) + args.max_new_tokens
-    union = maximum
-    if args.top_k is not None:
-        shared = min(2, args.top_k)  # sink and tail pages are shared across heads
-        union = min(
-            maximum, (shared + (args.top_k - shared) * cfg.num_attention_heads) * args.page_size
-        )
-    hot = HotConfig(union if args.max_union_rows is None else args.max_union_rows, args.hot_rows)
+    selected_rows = maximum if args.top_k is None else min(maximum, args.top_k * args.page_size)
+    hot = HotConfig(
+        selected_rows if args.max_selected_rows is None else args.max_selected_rows, args.hot_rows
+    )
     cache = HybridKVCache(
         CacheConfig(
             gpu_pages=args.gpu_pages or hot.admission_blocks(args.page_size, cfg.num_hidden_layers),
@@ -120,7 +123,9 @@ def main():
         cache.assert_invariants()
         report = {
             "model": args.model if tokenizer else "random decoder (mechanics demo)",
-            "selection": "full" if args.top_k is None else f"quest: {args.top_k} pages/head",
+            "selection": "full"
+            if args.top_k is None
+            else f"quest: {args.top_k} shared pages/query",
             "outputs": {
                 name: tokenizer.decode(tokens, skip_special_tokens=True) if tokenizer else tokens
                 for name, tokens in outputs.items()

@@ -27,13 +27,18 @@ def main():
     capture.add_argument("--prompt-file", type=Path)
     capture.add_argument("--max-context", type=int, default=256)
     capture.add_argument("--steps", type=int, default=8)
-    capture.add_argument("--tokens-per-head", type=int, default=8)
+    capture.add_argument(
+        "--tokens-per-query",
+        type=int,
+        default=8,
+        help="shared token budget across all attention heads",
+    )
     capture.add_argument("--layer", type=int, default=0)
     capture.add_argument(
         "--output", type=Path, required=True, help="save frozen CPU Q/K/V and token IDs"
     )
     replay.add_argument("trace", type=Path)
-    replay.add_argument("--hot-rows", type=int, help="default: observed maximum token union")
+    replay.add_argument("--hot-rows", type=int, help="default: maximum distinct selected rows")
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(42)
@@ -64,7 +69,7 @@ def main():
             model,
             tokens,
             args.steps,
-            args.tokens_per_head,
+            args.tokens_per_query,
             args.layer,
             source={
                 "model": args.model or "random decoder",

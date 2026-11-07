@@ -25,9 +25,9 @@ def main():
     cfg = model.config
     max_new_tokens, page_size, top_pages = 64, 16, 4
     maximum = len(tokens) + max_new_tokens
-    # Each head can choose different pages; sink and tail are shared.
-    union = min(maximum, (2 + (top_pages - 2) * cfg.num_attention_heads) * page_size)
-    hot = HotConfig(union)
+    # One page selection per query token, shared by all attention heads.
+    selected_rows = min(maximum, top_pages * page_size)
+    hot = HotConfig(selected_rows)
     cache = HybridKVCache(
         CacheConfig(
             gpu_pages=hot.admission_blocks(page_size, cfg.num_hidden_layers),

@@ -22,6 +22,17 @@ def test_quest_bounds_preserve_a_page_whose_mean_cancels():
     assert selection.pages == [0, 2]
 
 
+def test_quest_selects_one_shared_budget_before_address_resolution():
+    # Heads prefer different pages; averaging before top-k picks page 1,
+    # while independent top-k followed by a union would select pages 0 and 1.
+    bounds = torch.tensor([[[9.0, 0.0]], [[0.0, 10.0]], [[-1.0, -1.0]]])
+    selection = quest_selection(torch.eye(2), bounds, bounds, 5, 2, 2, keep_sink=False)
+    assert selection.positions == ((2, 3, 4),) * 2
+    topk = LogicalTopK.from_selection(selection, "cpu")
+    assert topk.positions.tolist() == [2, 3, 4]
+    assert topk.head_columns is None
+
+
 def test_resolver_protects_late_hits_deduplicates_and_maps_fragmented_blocks():
     def tensor(values):
         return torch.tensor(values, dtype=torch.int64)
