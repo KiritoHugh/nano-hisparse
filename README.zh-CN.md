@@ -30,19 +30,6 @@ nano-hisparse demo --device cpu
 nano-hisparse demo --device cuda:0 --dtype bfloat16
 ```
 
-## 使用预训练模型生成文本
-
-可选的模型适配器支持采用标准 RoPE 的 Qwen2/Qwen2.5。Transformers 提供分词器与预训练模块，KV 管理和 decode attention 由本项目执行。
-
-```bash
-python -m pip install -e '.[models]'
-nano-hisparse generate --model Qwen/Qwen2.5-0.5B-Instruct \
-  --device cuda:0 --dtype bfloat16 --chat \
-  --prompt '请解释 KV Cache 的工作原理。' --top-k 4 --max-new-tokens 64
-```
-
-首次运行会下载权重。`--top-k 4` 是**页预算**：Quest 风格选择器通过页内 K 的 min/max 边界评分，将 sink 页（序列第一页）和尾页（当前最后一页）计入预算，再把选中页展开为页内全部有效 token。默认每页 16 个 token，四页对应每个 query head 最多 64 个 token。缓存本身按 token row 解析和加载，下文的 row trace 示例直接验证这个更细的粒度。`--top-k all` 使用完整 attention，并预留相应更大的工作集。稀疏选择可能改变模型输出，其近似误差与缓存存储是否正确是两个独立问题。[examples/generate.py](examples/generate.py) 展示了 Python API 的用法。
-
 ## 工作原理
 
 一条 **KV 行（row）**包含一个 token 在当前层所有 KV heads 的 K 和 V。连续的若干行组成一个**逻辑页**，按 token 在序列中的位置编号；**物理块**则是 GPU 池中实际分配的存储位置。地址解析器（row resolver）负责把逻辑 token ID 转换为当前可读的 GPU 行地址。
@@ -82,9 +69,42 @@ H >= U
 
 `--gpu-pages` 只限制持久 KV 池的大小，模型权重、索引、激活和 prefill 工作区还需额外显存。运行 `nano-hisparse demo --help` 可查看配置选项。
 
-## Token-row 轨迹与局部性
+## 两种验证方式
 
-trace 是按 decode 步骤记录的访问轨迹，包含各 head 选择的 token ID 及回放所需的 Q/K/V。这个示例把**选择哪些 token**与**如何缓存这些 token 的 KV 行**分开：将每个 head 的 token ID 直接交给 `Selection.from_tokens`，执行真实的 row resolver 和 attention，并逐步与相同选择下的参考结果做数值对照。
+上述 KV 管理机制可以通过两个并列的入口观察：**在线生成关注模型与缓存能否协同完成解码，离线 trace 关注给定访问序列下的 row 管理与局部性。** 两者使用相同的缓存和 attention 实现，区别在于访问序列如何产生，以及结果用来说明什么。
+
+| 对比项 | 在线生成 | 离线 trace |
+|---|---|---|
+| 目的 | 验证预训练模型、KV 管理和增量解码能够协同运行 | 验证按行加载、复用与替换，并测量 row locality |
+| 访问来源 | 每步在线执行 Quest 风格的页选择，再展开为 token 行 | 受控 token 序列，或从模型 Q/K 离线计算的 token top-k |
+| 与生成的关系 | 本步稀疏 attention 的结果参与后续文本生成 | 模型采集使用完整 attention；固定 trace 后单独回放稀疏访问 |
+| 主要观察结果 | 生成文本、prefill/decode 次数、缓存命中与搬运计数 | 每步选择的行、hot 槽位、命中与 miss、搬运量、局部性和数值误差 |
+
+需要先看完整执行流程时，运行在线生成；需要检查 row 管理或比较 hot 容量时，运行离线 trace。两个入口可以独立运行。
+
+### 在线生成：验证模型与缓存协同解码
+
+这个入口将预训练 Qwen 接入本项目的推理流程，展示缓存管理如何参与实际文本生成。输入先经过分词与一次 prefill，建立 KV 历史；随后每步 decode 选择需要的历史 token，由缓存提供对应 KV 行并执行 attention，生成的 token 再进入下一步。
+
+可选的模型适配器支持采用标准 RoPE 的 Qwen2/Qwen2.5。Transformers 提供分词器与预训练模块，KV 管理和 decode attention 由本项目执行。
+
+```bash
+python -m pip install -e '.[models]'
+nano-hisparse generate --model Qwen/Qwen2.5-0.5B-Instruct \
+  --device cuda:0 --dtype bfloat16 --chat \
+  --prompt '请解释 KV Cache 的工作原理。' --top-k 4 --max-new-tokens 64 \
+  --output results/generation.json
+```
+
+首次运行会下载权重。`--top-k 4` 是**页预算**：Quest 风格选择器通过页内 K 的 min/max 边界评分，将 sink 页（序列第一页）和尾页（当前最后一页）计入预算，再把选中页展开为页内全部有效 token。默认每页 16 个 token，四页对应每个 query head 最多 64 个 token。缓存本身按 token row 解析和加载，下文的 row trace 示例直接验证这个更细的粒度。`--top-k all` 使用完整 attention，并预留相应更大的工作集。稀疏选择可能改变模型输出，其近似误差与缓存存储是否正确是两个独立问题。[examples/generate.py](examples/generate.py) 展示了 Python API 的用法。
+
+运行后查看 `results/generation.json`：`outputs` 是生成文本，`requests` 记录每个请求的 `prefill_count`、`decode_count` 和生成长度，`cache` 包含缓存计数。它们展示完整调用流程和实际缓存访问；是否发生历史页卸载取决于输入长度与容量配置，生成文本本身也不足以证明缓存数值正确或具有 row locality。下面的固定轨迹回放用于进一步检查这些性质。
+
+### 离线 trace：验证 row 管理与局部性
+
+这个入口固定访问序列，观察同一批 token 行如何在驻留区、主存和 hot buffer 之间被读取与复用。先用受控模式检查预期的命中和替换行为，再从真实模型 Q/K 采集轨迹，测量该样本中的 row locality。回放会执行真实的按行加载与 attention，并与相同选择下的参考输出对照，检查缓存处理是否改变计算结果。
+
+trace 是按 decode 步骤记录的访问轨迹，包含各 head 选择的 token ID 及回放所需的 Q/K/V。回放把这些 token ID 直接交给 `Selection.from_tokens`，保留各 head 独立的选择，并据此解析行地址：
 
 ```text
 各 head 的 token ID → 去重后的行并集 → resident / hot 命中 / miss
@@ -94,7 +114,7 @@ trace 是按 decode 步骤记录的访问轨迹，包含各 head 选择的 token
                                         保留各 head 掩码的 attention
 ```
 
-### 用受控访问验证 row 管理
+#### 用受控访问验证 row 管理
 
 无需下载模型。输出 JSON 包含每步各 head 的选择、row/page 并集、hot 槽位内容、命中、缺失和数值误差。
 
@@ -128,7 +148,7 @@ step 2:  rows 0,4,8,12    → pages 0,1,2,3
 
 H=4 和 H=8 分别使用三个和四个 device blocks，这里比较的是 hot 容量影响，而非相同总显存下的优劣。搬运量只计算缺失行的 K/V 有效载荷，不含元数据与总线事务开销；CPU 运行模拟这部分字节数。诊断路径会同步并计算参考 attention，不用于延迟测量。受控模式验证缓存行为，不能据此宣称真实模型具有局部性。
 
-### 从模型采集 token 级 trace
+#### 从模型采集 token 级 trace
 
 采集器记录**使用完整 attention 的模型某一层**的 Q 和增量 K/V，再离线按每个 query head 的精确 QK 分数选择历史 token。`--tokens-per-head 8` 选择八个 **token**，不展开整页，也不强制加入 sink/tail token。这种离线参考计算（oracle）需要读取全部 K，用于获得 trace；它不是 learned DSA indexer，也不是高效的在线选择器。模型仍使用完整 attention，因此更改 oracle 预算不会改变生成轨迹。
 

@@ -30,19 +30,6 @@ With CUDA-enabled PyTorch installed:
 nano-hisparse demo --device cuda:0 --dtype bfloat16
 ```
 
-## Pretrained generation
-
-The optional adapter loads Qwen2/Qwen2.5 models with standard RoPE. KV management and decode attention use this runtime; Transformers supplies the tokenizer and pretrained modules.
-
-```bash
-python -m pip install -e '.[models]'
-nano-hisparse generate --model Qwen/Qwen2.5-0.5B-Instruct \
-  --device cuda:0 --dtype bfloat16 --chat \
-  --prompt 'Explain how a KV cache works.' --top-k 4 --max-new-tokens 64
-```
-
-The first run downloads weights. `--top-k 4` is a **page budget**: the Quest-style selector scores page min/max key bounds, keeps the sink (first page) and tail (current last page) within the budget, and expands the chosen pages to all their valid tokens. With the default 16-token pages, four pages cover up to 64 tokens per query head. The cache itself resolves and loads individual token rows; the token-level trace example below exercises that finer granularity directly. `--top-k all` uses full attention and reserves a correspondingly larger working set. Sparse selection can change model outputs; it is separate from storage correctness. [examples/generate.py](examples/generate.py) shows the Python API.
-
 ## How it works
 
 A **KV row** contains one token's K and V across all KV heads in the current layer. Consecutive rows form a **logical page**, numbered by their positions in the sequence; a **physical block** is an actual allocation in the GPU pool. The **row resolver** translates logical token IDs into GPU row addresses that can currently be read.
@@ -82,9 +69,42 @@ minimum device blocks per request = L * (ceil(H / P) + 2)
 
 `--gpu-pages` bounds the persistent KV pool, not total GPU memory. Weights, indices, activations and prefill workspace need additional capacity. Run `nano-hisparse demo --help` for the available options.
 
-## Token-row traces and locality
+## Two ways to validate the runtime
 
-A trace records accesses by decode step: each head's token IDs and the Q/K/V needed for replay. This example separates **which tokens are selected** from **how their KV rows are cached**. It feeds per-head token IDs directly into `Selection.from_tokens`, runs the real row resolver and attention, and checks every output against a reference using exactly the same selection.
+The KV mechanisms above have two complementary entry points: **online generation checks how the model and cache work together during decoding; offline traces examine row management and locality for a fixed access sequence.** Both use the same cache and attention implementation. They differ in how accesses are produced and what the results establish.
+
+| Aspect | Online generation | Offline traces |
+|---|---|---|
+| Purpose | Exercise pretrained weights, KV management and incremental decoding together | Validate row loading, reuse and replacement, and measure row locality |
+| Access source | Quest-style page selection at each step, expanded into token rows | Controlled token sequences, or offline token top-k computed from model Q/K |
+| Relation to generation | Sparse attention affects subsequent generated tokens | Model capture uses full attention; frozen sparse accesses are replayed separately |
+| Main observations | Generated text, prefill/decode counts, cache hits and transfer counters | Selected rows, hot-slot contents, hits and misses, payload, locality and numerical error |
+
+Use online generation to follow the complete execution flow. Use offline traces to inspect row management or compare hot capacities. The two entry points run independently.
+
+### Online generation: exercise the model and cache together
+
+This entry point connects pretrained Qwen weights to the runtime and shows how cache management participates in text generation. Tokenization and one prefill establish the KV history. Each subsequent decode step selects historical tokens, obtains their KV rows through the cache and runs attention; generated tokens feed the following steps.
+
+The optional adapter loads Qwen2/Qwen2.5 models with standard RoPE. KV management and decode attention use this runtime; Transformers supplies the tokenizer and pretrained modules.
+
+```bash
+python -m pip install -e '.[models]'
+nano-hisparse generate --model Qwen/Qwen2.5-0.5B-Instruct \
+  --device cuda:0 --dtype bfloat16 --chat \
+  --prompt 'Explain how a KV cache works.' --top-k 4 --max-new-tokens 64 \
+  --output results/generation.json
+```
+
+The first run downloads weights. `--top-k 4` is a **page budget**: the Quest-style selector scores page min/max key bounds, keeps the sink (first page) and tail (current last page) within the budget, and expands the chosen pages to all their valid tokens. With the default 16-token pages, four pages cover up to 64 tokens per query head. The cache itself resolves and loads individual token rows; the token-level trace example below exercises that finer granularity directly. `--top-k all` uses full attention and reserves a correspondingly larger working set. Sparse selection can change model outputs; it is separate from storage correctness. [examples/generate.py](examples/generate.py) shows the Python API.
+
+Inspect `results/generation.json` after the run: `outputs` contains generated text, `requests` records each request's `prefill_count`, `decode_count` and generated length, and `cache` contains cache counters. These expose the complete execution flow and actual cache accesses. Historical eviction depends on input length and capacity settings; generated text alone does not establish numerical correctness or row locality. The fixed-trace replay below examines those properties directly.
+
+### Offline traces: validate row management and locality
+
+This entry point holds the access sequence fixed to inspect how token rows are read and reused across resident storage, host backing and the hot buffer. Controlled patterns first check expected hits and replacements; traces captured from real model Q/K then measure locality in that sample. Replay executes actual row loading and attention, comparing against a reference with the same selection to check whether cache handling changes the computation.
+
+A trace records accesses by decode step: each head's token IDs and the Q/K/V needed for replay. Replay feeds those IDs directly into `Selection.from_tokens`, preserving each head's independent selection when resolving row addresses:
 
 ```text
 per-head token IDs → deduplicated union → resident / hot hit / miss
@@ -94,7 +114,7 @@ per-head token IDs → deduplicated union → resident / hot hit / miss
                                       per-head masked attention
 ```
 
-### Controlled access patterns
+#### Controlled access patterns
 
 No model download is needed. The JSON contains every step's per-head selection, row/page unions, hot-slot contents, hits, misses and numerical error.
 
@@ -128,7 +148,7 @@ For selected row union `R_t` and its page set `P_t`, row J is `|R_t ∩ R_(t-1)|
 
 The H=4 and H=8 runs use three and four device blocks respectively, isolating hot capacity rather than comparing equal total memory. Payload counts only missing-row K/V bytes, excluding metadata and bus transaction overhead; CPU runs simulate that payload. Diagnostics synchronize and compute reference attention, so these runs are not latency benchmarks. Synthetic patterns validate cache behavior; they do not establish locality in a trained model.
 
-### Capture a model's token-level trace
+#### Capture a model's token-level trace
 
 Capture records Q and incremental K/V from **one layer of a dense teacher**, then ranks individual historical tokens by each query head's exact QK score. `--tokens-per-head 8` selects eight **tokens**, without expanding their pages or forcing sink/tail tokens. This offline reference computation, or oracle, reads all keys; it is not a learned DSA indexer or an efficient online selector. The teacher continues using full attention, so changing the oracle budget does not change the generation trajectory.
 
