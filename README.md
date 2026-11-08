@@ -45,18 +45,20 @@ logical tokens → resident lookup → hot lookup → miss plan
 
 - **Stable history.** Logical pages retain a host address while their device blocks can be reassigned. New KV is appended to resident tail pages and mirrored to host.
 - **Shared capacity.** Every request/layer reserves capacity for a hot region and two active tail blocks. History borrows unused capacity until pressure triggers a complete hot allocation.
-- **Safe reuse.** Historical pages with up-to-date host copies remain readable until actual block reuse revokes their mapping. The leases, generations and CUDA events below govern usage rights, detect stale references and order asynchronous operations.
+- **Safe reuse.** Historical pages with up-to-date host copies remain readable until actual block reuse revokes their mapping. Block reference counts govern reclamation; leases acquire and release references in pairs, while CUDA events order asynchronous operations.
 - **Row replacement.** The resolver protects all selected hot hits, then uses least recently used (LRU) replacement to evict the longest-unused remaining rows. Grouped-query attention (GQA) lets multiple query heads share one KV head. All attention heads use the same selected token IDs for a query; each still reads its corresponding KV head and computes its own attention weights.
 
 Returning from CPU code does not mean the GPU has finished reading data. Safe reuse therefore combines three mechanisms:
 
 | Term | Meaning and role in this project |
 |---|---|
-| **Lease** | A usage right explicitly acquired and released by code. An attention row lease protects the relevant resident pages and marks the layer's hot contents as busy, preventing the manager from changing their mappings or replacing their contents during that scope. Release records an event marking the end of the GPU use. |
-| **Generation** | A version counter incremented whenever a physical block is bound to a new use. References retain the block number, generation and owner; validation on use or release rejects stale references that would otherwise mistake new contents at the same address for old data. |
-| **CUDA event** | A completion marker inserted into a GPU stream, an ordered queue of operations. Attention waits for loading to finish, and subsequent overwrites wait for earlier reads. Events continue to protect pending GPU operations after the CPU releases a lease. |
+| **Reference count (ref_cnt)** | Counts the users holding a physical block. A resident allocation or hot region holds one reference, and each temporary reader holds another. Only a zero-reference block can be reclaimed for reuse. After history releases its allocation reference, its mapping and contents remain readable until overwritten; a reader acquires a new reference. |
+| **Lease** | A code object that holds references during a read. Construction increments reference counts; release records a GPU completion event and decrements the counts. Releasing twice or using a released lease raises an error. A row lease also marks the layer's hot contents as busy to prevent concurrent row replacement within that layer. |
+| **CUDA event** | A completion marker inserted into a GPU stream, an ordered queue of operations. Attention waits for loading to finish, and subsequent overwrites wait for earlier reads. Events continue to protect pending GPU operations after CPU-side reference counts reach zero. |
 
-For example, attention reads block 7 at generation 3. Releasing its lease records event E; rebinding the block increments its generation to 4. Writes for the new use must wait for E to avoid overwriting data still being read. A reference carrying generation 3 also fails validation. These checks address both when an overwrite is safe and whether a reference is still valid.
+For example, a historical page in block 7 has a completed host mirror and releases its allocation reference. Its `ref_cnt` is now zero, but the old contents remain readable. Attention acquires a lease, raising the count to one and preventing reclamation. Releasing the lease records event E and returns the count to zero. The manager can then revoke the old mapping and reassign the block; new writes must wait for E. The reference count governs reassignment, while the event governs when bytes can be overwritten.
+
+This follows the ownership rule in [vLLM BlockPool's reference counting and reuse notification](https://github.com/vllm-project/vllm/blob/abf98672ce7e822701f7a062bf240efb2c9900d1/vllm/v1/core/block_pool.py). `cache.page_state(...)` exposes the block's `ref_cnt` and the page's temporary `reader_refs`; the latter prevents appending while the page has readers.
 
 For page size `P`, hot rows `H`, layers `L` and maximum distinct selected token count `U` per query:
 

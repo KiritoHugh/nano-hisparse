@@ -272,3 +272,25 @@ def test_invalid_and_padding_only_topk_do_not_read_uninitialized_rows(device):
     output = row_attention(q, cache, "a", 0, topk(cache, [-1, -2, 100, 32]))
     torch.testing.assert_close(output, torch.zeros_like(output))
     assert cache.snapshot()["row_stats"]["misses"] == 0
+
+
+def test_resolve_failure_returns_resident_and_hot_references(device, monkeypatch):
+    cache = make(device)
+    cache.reserve("a", 40, 1)
+    write(cache)
+    before = [slot.ref_cnt for slot in cache.allocator.slots]
+
+    def fail(*args):
+        raise RuntimeError("injected resolver failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("nano_hisparse.hybrid.resolve_rows", fail)
+        with pytest.raises(RuntimeError, match="injected"):
+            cache.resolve("a", 0, topk(cache, [0, 4, 8, 31]))
+    assert [slot.ref_cnt for slot in cache.allocator.slots] == before
+    assert not cache.tables["a", 0].busy and not cache.storage.pinned
+    with cache.resolve("a", 0, topk(cache, [0, 4, 8, 31])):
+        cache.assert_invariants()
+    cache.release_request("a")
+    assert all(slot.ref_cnt == 0 for slot in cache.allocator.slots)
+    cache.assert_invariants()

@@ -66,43 +66,20 @@ class LayerTables:
         )
 
 
-class RowLease:
-    def __init__(self, cache, tables, plan, pages):
-        self.cache, self.tables, self.plan, self.pages = cache, tables, plan, pages
-        self.handles = [
-            (i, cache.allocator.slots[i].generation, cache.allocator.slots[i].owner)
-            for i in tables.blocks + [p.slot for p in pages]
-        ]
-        self.released = False
-
-    def _validate(self):
-        self.cache.storage.check_stream()
-        if self.released:
-            raise RuntimeError("row lease already released")
-        for handle in self.handles:
-            self.cache.allocator.validate(*handle)
+class RowLease(PageLease):
+    def __init__(self, cache, tables, pages):
+        super().__init__(cache.storage, pages, extra_slots=tables.blocks)
+        self.tables, self.plan = tables, None
+        tables.busy = True
 
     def wait(self):
         self._validate()
-        self.cache.storage.wait(self.cache.storage.compute, self.tables.ready)
+        self.store.wait(self.store.compute, self.tables.ready)
 
     def release(self):
-        self._validate()
-        self.tables.last_use = self.cache.storage.event(self.cache.storage.compute)
-        for page in self.pages:
-            page.last_use = self.tables.last_use
-            page.pins -= 1
-            if not page.pins:
-                self.cache.storage.pinned.discard(page.key)
+        super().release()
+        self.tables.last_use = self.done
         self.tables.busy = False
-        self.released = True
-
-    def __enter__(self):
-        self.wait()
-        return self
-
-    def __exit__(self, *_):
-        self.release()
 
 
 class HybridKVCache:
@@ -161,12 +138,12 @@ class HybridKVCache:
         return max(self.hot_blocks, self.budget // 10) if configured is None else configured
 
     def _available_blocks(self):
-        # Unpinned rows may be read again. Their temporary consumer leases are
-        # independent of allocation pins and exclude them from this list.
+        # Releasing allocation ownership leaves readable contents behind.
+        # A temporary reader raises ref_cnt and prevents actual block reuse.
         return sorted(i for i in self.allocator.free if i < self.budget) + [
             i
             for i in self.allocator.reclaimable
-            if i < self.budget and not self.storage.pages[self.owners[i]].pins
+            if i < self.budget and self.allocator.slots[i].ref_cnt == 0
         ]
 
     def _take_block(self, slot):
@@ -176,7 +153,8 @@ class HybridKVCache:
 
     def _on_block_reused(self, slot):
         page = self.storage.pages[self.owners[slot]]
-        assert not page.pins and page.host_committed_version == page.content_version
+        assert self.allocator.slots[slot].ref_cnt == 0
+        assert page.host_committed_version == page.content_version
         self._detach(page)
         self.storage.stats["unpinned_block_reuses"] += 1
 
@@ -210,8 +188,6 @@ class HybridKVCache:
         if page.valid_tokens:
             if page.slot is None:
                 raise RuntimeError("active append tail lost its resident lease")
-            page.pins += 1
-            self.storage.pinned.add(page.key)
             self.storage.stats["resident_hits"] += 1
             self.storage.stats["append_resident_hits"] += 1
             return PageLease(self.storage, [page])
@@ -224,8 +200,8 @@ class HybridKVCache:
         self.tables[page.key[:2]].resident[page.key[2]] = slot
 
     def _detach(self, page):
-        self.tables[page.key[:2]].resident[page.key[2]] = -1
         self.storage.detach(page)
+        self.tables[page.key[:2]].resident[page.key[2]] = -1
 
     def _historical_pages(self, group=None):
         candidates = []
@@ -239,7 +215,12 @@ class HybridKVCache:
             tail = (length - 1) // self.config.page_size
             if self._writing_key is not None and self._writing_key[:2] == key[:2]:
                 tail = self._writing_key[2]
-            if page.sealed and not page.pins and key[2] <= tail - ACTIVE_TAIL_PAGES:
+            allocation_ref = int(page.slot not in self.allocator.reclaimable)
+            if (
+                page.sealed
+                and self.allocator.slots[page.slot].ref_cnt == allocation_ref
+                and key[2] <= tail - ACTIVE_TAIL_PAGES
+            ):
                 candidates.append(page)
         return candidates
 
@@ -444,10 +425,7 @@ class HybridKVCache:
             for p in self.storage.pages.values()
             if p.key[:2] == (request_id, layer) and p.slot is not None
         ]
-        for page in pages:
-            page.pins += 1
-            self.storage.pinned.add(page.key)
-        tables.busy = True
+        lease = RowLease(self, tables, pages)
         try:
             self.storage.wait(self.storage.compute, tables.ready)
             plan = resolve_rows(
@@ -484,13 +462,10 @@ class HybridKVCache:
             if self.storage.cuda:
                 plan.miss_host_rows.record_stream(self.storage.transfer)
                 plan.miss_device_rows.record_stream(self.storage.transfer)
-            return RowLease(self, tables, plan, pages)
+            lease.plan = plan
+            return lease
         except Exception:
-            for page in pages:
-                page.pins -= 1
-                if not page.pins:
-                    self.storage.pinned.discard(page.key)
-            tables.busy = False
+            lease.release()
             raise
 
     def release_request(self, request_id, wait=True):
@@ -609,6 +584,7 @@ class HybridKVCache:
                 assert tables.hot_required
             for i, block in enumerate(tables.blocks):
                 assert self.owners[block] == (*group, -i - 1)
+                assert self.allocator.slots[block].ref_cnt == 1 + int(tables.busy)
             for index, host in enumerate(tables.source.tolist()):
                 page = self.storage.pages.get((*group, index))
                 assert host == (-1 if page is None else page.host_slot)

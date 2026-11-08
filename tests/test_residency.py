@@ -45,12 +45,12 @@ def test_unpinned_page_still_hits_until_actual_block_reuse(device):
     cache.storage.synchronize()
     page = cache.storage.pages["a", 0, 0]
     slot = page.slot
-    generation = cache.allocator.slots[slot].generation
+    assert cache.allocator.slots[slot].ref_cnt == 1
     host = page.host_slot
     cache.reclaim_history("a", 0)
     assert cache.page_state(page.key)["residency"] == "clean_unpinned"
     assert page.slot == slot and cache.tables["a", 0].resident[0].item() == slot
-    assert cache.allocator.slots[slot].generation == generation
+    assert cache.allocator.slots[slot].ref_cnt == 0
     assert cache.snapshot()["allocatable_device_blocks"] == 4  # 3 empty + 1 readable
 
     q = torch.randn(2, 8, device=device)
@@ -63,9 +63,7 @@ def test_unpinned_page_still_hits_until_actual_block_reuse(device):
     assert page.slot is None and page.host_slot == host
     assert cache.tables["a", 0].resident[0].item() == -1
     assert cache.owners[slot] == ("b", 0, 3)
-    assert cache.allocator.slots[slot].generation == generation + 1
-    with pytest.raises(RuntimeError, match="stale"):
-        cache.allocator.validate(slot, generation, page.key)
+    assert cache.allocator.slots[slot].ref_cnt == 1
     actual = row_attention(q, cache, "a", 0, select(cache, [0]))
     torch.testing.assert_close(actual, dense_attention(q, k[:1], v[:1]))
     assert cache.snapshot()["row_stats"]["misses"] == 1
@@ -83,7 +81,12 @@ def test_consumer_lease_temporarily_protects_a_readable_free_block(device):
     slot = page.slot
     with cache.resolve("a", 0, select(cache, [0])) as lease:
         assert slot in cache.allocator.reclaimable
+        assert cache.allocator.slots[slot].ref_cnt == 1
         assert slot not in cache._available_blocks()
+        with pytest.raises(RuntimeError, match="active references"):
+            cache.allocator.reclaim(slot)
+        assert all(cache.allocator.slots[i].ref_cnt == 2 for i in cache.tables["a", 0].blocks)
+        cache.assert_invariants()
         if cache.storage.cuda:
             torch.cuda._sleep(2_000_000)
         observed = cache.pool[slot, 0, 0].clone()
@@ -93,6 +96,10 @@ def test_consumer_lease_temporarily_protects_a_readable_free_block(device):
         lease._validate()
     torch.testing.assert_close(observed, k[0])
     assert slot in cache._available_blocks()
+    assert cache.allocator.slots[slot].ref_cnt == 0
+    assert all(cache.allocator.slots[i].ref_cnt == 1 for i in cache.tables["a", 0].blocks)
+    with pytest.raises(RuntimeError, match="released"):
+        lease.release()
     cache.assert_invariants()
 
 
@@ -287,6 +294,7 @@ def test_allocation_revisits_a_group_whose_mirror_was_published_late(monkeypatch
     page = cache.storage.pages["a", 0, 0]
     slot = page.slot
     cache.allocator.reclaimable.pop(slot)
+    cache.allocator.incref(slot)  # Restore allocation ownership for this policy test.
     page.host_committed_version = 0
     assert not cache.allocator.free
 

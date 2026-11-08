@@ -36,7 +36,6 @@ class Page:
     ready: object = None
     last_use: object = None
     host_ready: object = None
-    request_generation: int = 0
     content_version: int = 0
     host_enqueued_version: int = 0
     host_committed_version: int = 0
@@ -53,25 +52,40 @@ class RequestPages:
     minimum: torch.Tensor
     maximum: torch.Tensor
     host_credits: int
-    generation: int
     keys: list[PageKey] = field(default_factory=list)
     extra_index_bytes: int = 0
     keepalive: tuple = ()  # caller metadata retained through the retirement event
 
 
 class PageLease:
-    """Pins protect mappings on CPU; events protect bytes on the accelerator."""
+    """References protect CPU ownership; events protect pending GPU operations."""
 
-    def __init__(self, store: HostStore, pages: list[Page]):
-        self.store, self.pages, self.released = store, pages, False
-        self.handles = [(p.slot, store.allocator.slots[p.slot].generation, p.key) for p in pages]
+    def __init__(self, store: HostStore, pages: list[Page], *, extra_slots=()):
+        store.check_stream()
+        # A retired/detached Page object cannot acquire a new reference even if
+        # its request ID has since been reused. Live leases prevent detachment.
+        if any(
+            store.pages.get(p.key) is not p
+            or p.slot is None
+            or store.allocator.slots[p.slot].owner != p.key
+            for p in pages
+        ):
+            raise RuntimeError("cannot reference a detached or retired page")
+        self.store, self.pages, self.released = store, list(pages), False
+        self.slots = [p.slot for p in pages] + list(extra_slots)
+        if any(store.allocator.slots[i].owner is None for i in self.slots):
+            raise RuntimeError("cannot reference an unbound block")
+        for slot in self.slots:
+            store.allocator.incref(slot)
+        for page in self.pages:
+            page.pins += 1  # page-level reader count, used to reject concurrent append
+            store.pinned.add(page.key)
+        self.done = None
 
     def _validate(self):
         self.store.check_stream()
         if self.released:
             raise RuntimeError("lease already released")
-        for handle in self.handles:
-            self.store.allocator.validate(*handle)
 
     def wait(self):
         self._validate()
@@ -80,12 +94,14 @@ class PageLease:
 
     def release(self):
         self._validate()
-        done = self.store.event(self.store.compute)
+        self.done = self.store.event(self.store.compute)
         for page in self.pages:
-            page.last_use = done
+            page.last_use = self.done
             page.pins -= 1
             if page.pins == 0:
                 self.store.pinned.discard(page.key)
+        for slot in self.slots:
+            self.store.allocator.decref(slot)
         self.released = True
 
     def __enter__(self):
@@ -118,7 +134,6 @@ class HostStore:
         self.stats: Counter = Counter()
         self.pinned: set[PageKey] = set()
         self.retired: list[tuple[object, RequestPages, list[Page]]] = []
-        self.request_generation = 0
 
     @property
     def budget(self):
@@ -203,10 +218,8 @@ class HostStore:
             torch.full_like(summaries, torch.inf, dtype=self.config.dtype),
             torch.full_like(summaries, -torch.inf, dtype=self.config.dtype),
             n * layers,
-            self.request_generation,
         )
         request.extra_index_bytes = extra_index_bytes
-        self.request_generation += 1
         self.requests[request_id] = request
 
     def materialize(self, request_id, layer, index):
@@ -216,11 +229,12 @@ class HostStore:
             assert request.host_credits > 0 and self.free_host
             request.host_credits -= 1
             request.keys.append(key)
-            self.pages[key] = Page(key, self.free_host.pop(), request_generation=request.generation)
+            self.pages[key] = Page(key, self.free_host.pop())
             self.stats["materialized_pages"] += 1
         return self.pages[key]
 
     def detach(self, page: Page):
+        assert self.pages.get(page.key) is page
         assert page.slot is not None and page.pins == 0
         slot = page.slot
         assert page.host_enqueued_version == page.content_version
@@ -365,10 +379,8 @@ class HostStore:
             "content_version": page.content_version,
             "host_committed_version": page.host_committed_version,
             "sealed": page.sealed,
-            "request_generation": page.request_generation,
-            "slot_generation": self.allocator.slots[page.slot].generation
-            if page.slot is not None
-            else None,
+            "reader_refs": page.pins,
+            "ref_cnt": self.allocator.slots[page.slot].ref_cnt if page.slot is not None else None,
         }
 
     def synchronize(self):
@@ -423,6 +435,10 @@ class HostStore:
         assert set(self.allocator.lru) == set(occupied)
         assert self.allocator.free == {i for i, key in enumerate(self.owners) if key is None}
         assert +self.allocator.occupancy == Counter(key[0] for key in occupied)
+        for slot in self.allocator.slots:
+            assert slot.ref_cnt >= 0
+            if slot.owner is None:
+                assert slot.ref_cnt == 0
         assert self.index_bytes <= self.config.index_budget_bytes
         for request in self.requests.values():
             assert len(request.keys) + request.host_credits == request.layers * request.page_count
@@ -434,6 +450,7 @@ class HostStore:
             else:
                 assert self.owners[page.slot] == key
                 assert page.location == Location.RESIDENT
+                allocation_ref = int(page.slot not in self.allocator.reclaimable)
+                assert self.allocator.slots[page.slot].ref_cnt == allocation_ref + page.pins
             assert page.pins == 0 or page.slot is not None
-            assert page.request_generation == self.requests[key[0]].generation
             assert page.host_committed_version <= page.host_enqueued_version == page.content_version

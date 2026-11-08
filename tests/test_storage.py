@@ -21,8 +21,6 @@ def test_append_mirrors_only_new_rows_and_retirement_releases_backing():
         if page.slot is None:
             store.bind(page, min(store.allocator.free), Location.RESIDENT)
         else:
-            page.pins += 1
-            store.pinned.add(page.key)
             return PageLease(store, [page])
 
     k, v = torch.randn(9, 1, 4), torch.randn(9, 1, 4)
@@ -34,7 +32,8 @@ def test_append_mirrors_only_new_rows_and_retirement_releases_backing():
     assert store.stats["d2h_bytes"] == 9 * 2 * 4 * 4
     assert store.pages["a", 0, 0].content_version == 2
     assert store.pages["a", 0, 0].sealed
-    generation = store.requests["a"].generation
+    old_request = store.requests["a"]
+    old_page = store.pages["a", 0, 0]
     for page in list(store.pages.values()):
         store.detach(page)
     store.retire("a")
@@ -42,7 +41,12 @@ def test_append_mirrors_only_new_rows_and_retirement_releases_backing():
     store.assert_invariants()
     assert len(store.free_host) == 6
     store.reserve("a", 12, 1)
-    assert store.requests["a"].generation > generation
+    assert store.requests["a"] is not old_request
+    new_page = store.materialize("a", 0, 0)
+    store.bind(new_page, min(store.allocator.free), Location.RESIDENT)
+    with pytest.raises(RuntimeError, match="retired page"):
+        PageLease(store, [old_page])
+    assert store.allocator.slots[new_page.slot].ref_cnt == 1
 
 
 def test_host_credits_account_for_unmaterialized_pages():
@@ -52,4 +56,29 @@ def test_host_credits_account_for_unmaterialized_pages():
     with pytest.raises(CapacityError, match="host credits"):
         store.reserve("b", 1, 1)
     assert set(store.requests) == {"a"}
+    store.assert_invariants()
+
+
+def test_overlapping_page_leases_balance_references_and_reject_released_handles():
+    store = make_store()
+    store.reserve("a", 4, 1)
+    page = store.materialize("a", 0, 0)
+    store.bind(page, 0, Location.RESIDENT)
+    store.allocator.unpin(0, lambda slot: store.detach(page))
+    first, second = PageLease(store, [page]), PageLease(store, [page])
+    assert store.allocator.slots[0].ref_cnt == page.pins == 2
+    first.release()
+    assert store.allocator.slots[0].ref_cnt == page.pins == 1
+    with pytest.raises(RuntimeError, match="active references"):
+        store.allocator.reclaim(0)
+    second.release()
+    assert store.allocator.slots[0].ref_cnt == page.pins == 0
+    store.allocator.reclaim(0)
+    store.bind(page, 0, Location.RESIDENT)
+    for lease in (first, second):
+        with pytest.raises(RuntimeError, match="released"):
+            lease.wait()
+        with pytest.raises(RuntimeError, match="released"):
+            lease.release()
+    assert store.allocator.slots[0].ref_cnt == 1
     store.assert_invariants()
